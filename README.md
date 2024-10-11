@@ -33,11 +33,10 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
 - **Advanced Filtering**: Apply filters on Mapping Quality (MAPQ), read mismatch counts, and C>T changes.
 - **File Upload and Conversion**: Support for BAM, SAM, FASTA, and FASTQ files. Batch conversion between these formats.
 - **Centrifuge Integration**: Perform taxonomic classification on FASTQ files.
-- **Customizable Interface**: User-configurable themes and settings to adjust visualization preferences.
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.9+
 - Dependencies (see `requirements.txt`):
   - dash
   - dash-bootstrap-components
@@ -51,7 +50,7 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
   - redis
   - yaml
 - **Redis**: Required for Celery task queue.
-- **Centrifuge**: For taxonomic classification features.
+- **Centrifuge**: For taxonomic classification features only. Dashboard works perfectly fine without Centrifuge being installed.
 
 ## Installation and Setup
 
@@ -182,9 +181,9 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
      ```
      The dashboard will be accessible at [http://127.0.0.1:8050/](http://127.0.0.1:8050/).
 
-### Opening WSL in VSCode
+### Opening WSL in VSCode (optional):
 
-1. **Install VSCode**:
+1. **Install VSCode (if not already installed)**:
    - Download and install [Visual Studio Code](https://code.visualstudio.com/).
 
 2. **Install the WSL Extension**:
@@ -227,7 +226,7 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
   - Mismatch Frequencies
   - Alignment Statistics
 
-- **Interactive Plots**: Click and drag on the histograms to select specific ranges or data points. The selections will update the other visualizations accordingly.
+- **Interactive Plots**: Click and drag on the histograms to select specific ranges or data points. The selections will update the other visualizations accordingly (not working with read length distribution).
 
 ### File Conversion
 
@@ -236,6 +235,7 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
 - Select the desired output format.
 - Click "Convert Files" to start the conversion.
 - Converted files can be downloaded directly or as a ZIP archive if multiple files are converted.
+- Please note that fasta/q to BAM/SAM conversions will generate dummy headers and empty metadata as fasta/q files do not contain BAM/SAM specific data.
 
 ### Centrifuge Analysis
 
@@ -260,7 +260,6 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
 - `config.yaml`: Configuration file for application settings.
 - `requirements.txt`: Python dependencies.
 - `assets/`: Folder for custom CSS and assets used in the dashboard.
-- `tasks.py`: Celery tasks definitions.
 - `templates/`: HTML templates for the Dash application.
 - `README.md`: Project documentation.
 
@@ -269,6 +268,9 @@ GRAFT is an interactive dashboard for genomic data analysis especially for worki
 - **Performance**: Processing large BAM files can be slow and may consume significant memory. Consider downsampling or using a machine with higher specifications.
 - **File Compatibility**: Ensure uploaded files conform to the appropriate format specifications. Corrupted or improperly formatted files may cause errors.
 - **Centrifuge Database**: The database for Centrifuge can be large. Ensure you have sufficient disk space and that the path is correctly set in the settings.
+- **Data Selecting**: Selecting data from the read length histogram might not always work. This is a limitation of the plotly library.
+- **Exporting data**: The export file function is still under development and not fully implemented.
+- **Centrifuge implementation**: Proper centrifuge taxonomic classification is not working yet. This is a placeholder module with basic functionality.
 
 ## Contributing
 
