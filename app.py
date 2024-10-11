@@ -9,7 +9,6 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
-import threading
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.colors
@@ -32,20 +31,19 @@ try:
 except FileNotFoundError:
     config = {}
 
-# Get Centrifuge DB Path
 default_centrifuge_db_path = config.get('centrifuge_db_path', '')
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SOLAR, "/assets/custom.css"], suppress_callback_exceptions=True) # general dash theme, can be changed but colors need to be adjusted accordingly (if you want a pretty dashboard)
 celery_app = Celery('tasks', broker='redis://localhost:6379/0')
 
-# custom temp directory for storing the data (needs better implementation)
+# custom temp directory for storing the data (needs better implementation, but works fine)
 CUSTOM_TEMP_DIR = tempfile.mkdtemp()
 os.makedirs(CUSTOM_TEMP_DIR, exist_ok=True)
 
 # Set TMPDIR environment variable to ensure pysam uses the custom temporary directory
 os.environ["TMPDIR"] = CUSTOM_TEMP_DIR
 
-# unified color palette
+# color palette
 colors = {
     'primary': '#6200EA',    # Deep Purple
     'secondary': '#03DAC6',  # Teal
@@ -104,8 +102,8 @@ def process_uploaded_file(content, filename):
     else:
         raise ValueError(f"Unsupported file extension: {file_ext}")
 
-    # Split the content into the content type and the actual base64-encoded data
-    content_type, content_string = content.split(',')
+    
+    content_type, content_string = content.split(',') # content_type is necessary, VScode just doesn't see its reference
 
     # Decode the base64-encoded string
     decoded = base64.b64decode(content_string)
@@ -319,7 +317,7 @@ def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
 
 
 
-def categorize_mismatches(mismatches):
+def categorize_mismatches(mismatches): # have to check whether this makes sense
     categories = {
         'Transitions': 0,
         'Transversions': 0,
@@ -392,7 +390,7 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
         marker_color=colors['line']
     ))
 
-    # Calculate mean CG content
+    
     mean_cg_content = calculate_mean_cg_content(read_lengths, bins)
 
     # CG content markers (including zeros)
@@ -526,7 +524,7 @@ def create_damage_pattern_plot(mismatches):
 def create_detailed_mismatch_pie_chart(stats):
     mismatch_counts = stats.get('Mismatch Counts')
     
-    # Check if mismatch_counts is not 'N/A'
+    # for everything that has no mismatches 
     if mismatch_counts == 'N/A' or not mismatch_counts:
         return go.Figure().update_layout(
             title_text="No mismatch data available",
@@ -535,12 +533,13 @@ def create_detailed_mismatch_pie_chart(stats):
         )
     sorted_keys = sorted(mismatch_counts.keys(), key=lambda x: (x[0], x[2]))  # Sort by base
     
+    # The rest of the function (plotting) is way too complex for a pretty visualization
     # Define color ramps for each base using Plotly colors
     color_map = {
         'A': plotly.colors.sequential.Blues,
         'C': plotly.colors.sequential.Oranges,
         'G': plotly.colors.sequential.Greens,
-        'T': plotly.colors.sequential.Reds_r
+        'T': plotly.colors.sequential.Reds_r # otherwise not really visible
     }
     
     # Assign colors to each mismatch type
@@ -621,7 +620,7 @@ def calculate_mismatch_frequency(read_lengths, file_format):
         return None  # Mismatch frequency is not applicable
 
     # Initialize arrays to store mismatch counts at each distance
-    max_distance = 30  # Define maximum distance to consider
+    max_distance = 30  # Define maximum distance to consider, can be changed
     counts = {'C>T': [0] * max_distance, 'G>A': [0] * max_distance, 'other': [0] * max_distance}
     total_reads = len(read_lengths)
 
@@ -632,7 +631,7 @@ def calculate_mismatch_frequency(read_lengths, file_format):
     for _, _, _, _, read, _ in read_lengths:
         mismatches = get_mismatch_pattern(read)
         if not mismatches:
-            continue  # Skip reads without mismatch data
+            continue  
         for mismatch_type, count in mismatches.items():
             if mismatch_type in counts:
                 for position in range(min(len(counts[mismatch_type]), count)):
@@ -664,7 +663,7 @@ def create_mismatch_frequency_plot(frequencies):
     # Define the distance range
     x_values = list(range(len(frequencies['C>T'])))
 
-    # Add traces for each type of mismatch with enhanced styling matching the histogram plot
+    # traces for each type, not really consistent with the rest of the styling theme
     fig.add_trace(go.Scatter(
         x=x_values,
         y=frequencies['C>T'],
@@ -692,7 +691,7 @@ def create_mismatch_frequency_plot(frequencies):
         marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
     ))
 
-    # Update layout to enhance readability and style, matching the histogram's theme
+    
     fig.update_layout(
         title=dict(
             text='Mismatch Frequency vs Distance from Read End',
@@ -739,7 +738,7 @@ def create_mismatch_frequency_plot(frequencies):
         margin=dict(t=50, b=50, l=50, r=50)
     )
 
-    # Add hover information for better user interaction
+    
     fig.update_traces(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
 
     return fig
@@ -801,14 +800,14 @@ def calculate_overall_cg_content(read_lengths):
     cg_contents = [cg for _, cg, _, _, _, _ in read_lengths]
     return cg_contents
 
-def count_ct_changes(read):
+def count_ct_changes(read): # function is older than calculate_mismatch_frequency, a bit redundant
     if isinstance(read, pysam.AlignedSegment):
         pattern = get_deamination_pattern(read)
         return pattern.count('C>T') + pattern.count('G>A')
     else:
-        return 0  # For FASTA/FASTQ records, we can't determine C>T changes
+        return 0  # For FASTA/FASTQ records, you can't determine C>T changes
         
-def adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value):
+def adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value): # for filtering section, for subtracting all C>Ts from NM without removing them from the list
     adjusted_read_lengths = []
     for length, cg, nm, seq, read, mapq in read_lengths:
         ct_changes = count_ct_changes(read)
@@ -920,13 +919,13 @@ def get_alignment_stats_text(stats):
     for key, value in stats.items():
         if key not in ['Mismatch Counts', 'Mismatch Details']:
             text_output += f"{key}: {value}\n"
-    # Include mismatch counts
+    # mismatch counts added 
     mismatch_counts = stats.get('Mismatch Counts', {})
     if mismatch_counts and mismatch_counts != 'N/A':
         text_output += "\nMismatch Counts:\n"
         for mismatch, count in mismatch_counts.items():
             text_output += f"{mismatch}: {count}\n"
-    # Include mismatch categories
+    # mismatch categories added, but idk if this is correct
     if stats.get('Mismatch Details') != 'N/A':
         categories = categorize_mismatches(stats['Mismatch Details'])
         text_output += "\nMismatch Categories:\n"
@@ -1043,7 +1042,7 @@ settings_offcanvas = dbc.Offcanvas(
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # Data Processing Section with Centrifuge DB Path
+        # Data Processing Section
         dbc.Card([
             dbc.CardHeader(
                 dbc.Row([
@@ -1258,7 +1257,7 @@ def create_header():
     ], fluid=True, className="header-container")
 
 
-# Define the Navbar separately for reuse
+# Define the Navbar separately for reuse 
 navbar = dbc.Navbar(
     dbc.Container([
         html.A(
@@ -1498,7 +1497,7 @@ layout_main = dbc.Container([
 
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
 
-# Add custom CSS
+# Add custom CSS, have to merge with external assets css
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -1608,10 +1607,10 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
 
     for content, filename in zip(contents_list, filenames):
         try:
-            # Process the uploaded file
+            
             temp_input_path, input_format = process_uploaded_file(content, filename)
 
-            # Define supported conversions, including the new ones
+            
             supported_conversions = {
                 ('bam', 'sam'),
                 ('sam', 'bam'),
@@ -1634,19 +1633,19 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
                 status_messages.append(f'Conversion from {input_format.upper()} to {output_format.upper()} is not supported for {filename}.')
                 continue
 
-            # Create a temporary output file path
+            # temp file path, reused as in main analysis tab
             output_filename = f"{os.path.splitext(filename)[0]}_converted.{output_format}"
             temp_output_path = os.path.join(CUSTOM_TEMP_DIR, output_filename)
 
-            # Perform the conversion
+            # conversion
             if input_format in ['bam', 'sam'] and output_format in ['bam', 'sam']:
-                # Convert between BAM and SAM
+                # sam/bam
                 with pysam.AlignmentFile(temp_input_path, "rb" if input_format == 'bam' else 'r') as infile:
                     with pysam.AlignmentFile(temp_output_path, "wb" if output_format == 'bam' else 'w', header=infile.header) as outfile:
                         for read in infile:
                             outfile.write(read)
             elif input_format in ['bam', 'sam'] and output_format in ['fasta', 'fastq']:
-                # Convert BAM/SAM to FASTA/FASTQ
+                # bam/sam to fasta/q
                 with pysam.AlignmentFile(temp_input_path, "rb" if input_format == 'bam' else 'r') as infile:
                     with open(temp_output_path, 'w') as outfile:
                         for read in infile:
@@ -1664,14 +1663,14 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
                                     qual_str = ''.join([chr(q + 33) for q in qual])
                                 outfile.write(f'@{read_name}\n{seq}\n+\n{qual_str}\n')
             elif input_format == 'fastq' and output_format in ['bam', 'sam']:
-                # Convert FASTQ to BAM/SAM
+                # fastq to bam/sam
                 header = {
                     'HD': {'VN': '1.0'},
                     'SQ': [{'LN': 1, 'SN': 'chrUn'}]  # Dummy reference
                 }
                 with pysam.AlignmentFile(temp_output_path, "wb" if output_format == 'bam' else 'w', header=header) as outfile:
                     for record in SeqIO.parse(temp_input_path, 'fastq'):
-                        # Create a new unmapped read
+                        # new unmapped read
                         a = pysam.AlignedSegment()
                         a.query_name = record.id
                         a.query_sequence = str(record.seq)
@@ -1680,20 +1679,20 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
                         a.query_qualities = pysam.qualitystring_to_array(record.letter_annotations["phred_quality"])
                         outfile.write(a)
             elif input_format == 'fasta' and output_format == 'fastq':
-                # Convert FASTA to FASTQ with dummy quality scores
+                # fasta to fastq
                 with open(temp_output_path, 'w') as outfile:
                     for record in SeqIO.parse(temp_input_path, 'fasta'):
                         record.letter_annotations["phred_quality"] = [40] * len(record.seq)  # Assign dummy quality
                         SeqIO.write(record, outfile, 'fastq')
             elif input_format == 'fasta' and output_format in ['bam', 'sam']:
-                # Convert FASTA to BAM/SAM with dummy qualities
+                # fasta to bam/sam
                 header = {
                     'HD': {'VN': '1.0'},
                     'SQ': [{'LN': 1, 'SN': 'chrUn'}]  # Dummy reference
                 }
                 with pysam.AlignmentFile(temp_output_path, "wb" if output_format == 'bam' else 'w', header=header) as outfile:
                     for record in SeqIO.parse(temp_input_path, 'fasta'):
-                        # Create a new unmapped read
+                        # new unmapped read again
                         a = pysam.AlignedSegment()
                         a.query_name = record.id
                         a.query_sequence = str(record.seq)
@@ -1703,7 +1702,7 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
                         a.query_qualities = [40] * len(record.seq)
                         outfile.write(a)
             elif input_format in ['fastq', 'fasta'] and output_format in ['fastq', 'fasta']:
-                # Convert between FASTA and FASTQ
+                # fasta/fastq
                 records = list(SeqIO.parse(temp_input_path, input_format))
                 if input_format == 'fasta' and output_format == 'fastq':
                     for record in records:
@@ -1726,13 +1725,13 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
         ])
 
     if len(converted_files) == 1:
-        # Send the single file directly
+        # download directly if only one file
         return dcc.send_file(converted_files[0]), html.Div([
             html.H5("Conversion Status:"),
             html.Ul([html.Li(msg) for msg in status_messages])
         ])
     else:
-        # Create a ZIP archive of all converted files
+        # Create a ZIP archive if more than one file
         zip_filename = f'converted_files_{uuid.uuid4()}.zip'
         zip_path = os.path.join(CUSTOM_TEMP_DIR, zip_filename)
 
@@ -1895,30 +1894,30 @@ def run_centrifuge(n_clicks, selected_file, store_data, db_path):
     if not db_path:
         return html.Div("Centrifuge database path not specified. Please set it in the settings.", className="text-danger"), True, None, None
 
-    # Get the file path
+    
     file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
     if file_data is None:
         return html.Div("File data not found.", className="text-danger"), True, None, None
 
     temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
 
-    # Ensure the file is in FASTQ format
+    # file must be in fastq (centrifuge only supports fastq; might add automatic conversion)
     if file_format not in ['fastq', 'fq']:
         return html.Div("Centrifuge requires FASTQ files. Please upload a FASTQ file.", className="text-danger"), True, None, None
 
-    # Define output file paths
+    
     centrifuge_output_path = os.path.join(CUSTOM_TEMP_DIR, f"centrifuge_output_{uuid.uuid4()}.txt")
     centrifuge_report_path = os.path.join(CUSTOM_TEMP_DIR, f"centrifuge_report_{uuid.uuid4()}.txt")
 
-    # Start the task
+    
     task = run_centrifuge_task.delay(temp_file_path, centrifuge_output_path, centrifuge_report_path, db_path)
 
-    # Provide a message to the user
+    # return message
     return html.Div(f"Centrifuge analysis started. Task ID: {task.id}", className="text-success"), False, task.id, centrifuge_report_path
 
 
 
-def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path):
+def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path): # visual error, n_intervals is being accessed
     if not task_id:
         raise dash.exceptions.PreventUpdate
 
@@ -2056,7 +2055,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
         empty_text = ""
         return empty_figure, empty_figure, empty_figure, empty_figure, [], empty_figure, empty_text, empty_figure, empty_figure, empty_figure
 
-    # Load and process the file content
+    # Load and process file content
     read_lengths, file_format, deduped_file_path = load_and_process_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
     )
@@ -2076,13 +2075,13 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
             font=dict(color=colors['muted'])
         )
 
-    # Prepare data for the read length histogram
+    
     bin_centers, hist, bins = prepare_histogram_data(read_lengths)
 
-    # Generate the Read Length Distribution Figure
+    
     read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
 
-    # Create Overall CG Content Figure
+    
     overall_cg_content = calculate_overall_cg_content(read_lengths)
     overall_cg_fig = go.Figure()
     overall_cg_fig.add_trace(go.Histogram(
@@ -2099,7 +2098,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
         font=dict(color=colors['muted'])
     )
 
-    # Handle selection data for CG Content histogram
+    # selection data for CG content hist
     selected_lengths = current_selected_lengths
     if read_length_selectedData:
         selected_x_values = [point['x'] + 0.5 for point in read_length_selectedData['points']]
@@ -2116,7 +2115,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
     five_prime_end, three_prime_end = get_damage_patterns(deduped_file_path, file_format, filter_ct=filter_ct)
     damage_fig = create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 
-    # Extract MAPQ scores
+    
     mapq_scores = [mapq for _, _, _, _, _, mapq in read_lengths if mapq is not None]
     # Create MAPQ histogram
     mapq_fig = create_mapq_histogram(mapq_scores)
@@ -2138,16 +2137,16 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
             key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
             filtered_mismatch_counts[key] = filtered_mismatch_counts.get(key, 0) + 1
 
-        # Create mismatch type bar chart
+        # plotting
         mismatch_type_fig = create_mismatch_type_bar_chart(filtered_mismatch_counts)
 
-        # Create damage pattern plot
+        
         damage_pattern_fig = create_damage_pattern_plot(filtered_mismatches)
     else:
         mismatch_type_fig = go.Figure()
         damage_pattern_fig = go.Figure()
 
-    # After generating all the plots, extract the data summaries
+    # data summary after generating all plots
     read_length_text = get_read_length_data(read_lengths)
     cg_content_text = get_overall_cg_content_data(read_lengths)
     damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
@@ -2155,8 +2154,6 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
     stats_text = get_alignment_stats_text(stats)
     read_length_cg_average_text = get_read_length_CG_average(read_lengths)
     filter_options_text = get_filter_options_text(selected_nm, ct_checklist, ct_count_value, mapq_range_tuple)
-
-    # Optionally, include CG distribution for selected reads
     selected_cg_contents = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
     if selected_cg_contents:
         cg_series = pd.Series(selected_cg_contents)
@@ -2169,7 +2166,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
     else:
         cg_distribution_text = "No CG content data for selected reads.\n"
 
-    # Combine all text data
+    # combined data
     data_summary_text = (
         filter_options_text + "\n" +
         read_length_text + "\n" +
@@ -2181,7 +2178,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
         stats_text
     )
 
-    # Return all figures and data
+    # main return
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
         selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
