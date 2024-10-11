@@ -26,7 +26,7 @@
 
 
 
-GRAFT is an interactive dashboard for genomic data analysis especially for working with aDNA data, focusing on BAM, SAM, FASTA, and FASTQ files. Built with Dash and Plotly, GRAFT provides functionalities for data upload, visualization, filtering, and batch conversion of genomic read files. It supports exploring read length distributions, CG content, damage patterns, and mismatch frequencies.
+GRAFT is an interactive dashboard written in Python for genomic data analysis especially for working with aDNA data, focusing on BAM, SAM, FASTA, and FASTQ files. Built with Dash and Plotly, GRAFT provides functionalities for data upload, visualization, filtering, and batch conversion of genomic read files. It supports exploring read length distributions, CG content, damage patterns, and mismatch frequencies.
 ## Features
 
 - **Interactive Data Visualization**: Visualize read length distributions, CG content, damage patterns, and mismatch frequencies.
