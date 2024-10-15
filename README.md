@@ -175,6 +175,8 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
 
 8. **Running the Application**:
 
+   - Set the Centrifuge library folder in the `config.yaml`
+
    - To start the dashboard, run:
      ```bash
      python app.py
