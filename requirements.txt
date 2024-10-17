@@ -1,30 +1,12 @@
-amqp==5.2.0
-billiard==4.2.1
-biopython @ file:///home/conda/feedstock_root/build_artifacts/biopython_1704895401961/work
-celery==5.4.0
-click==8.1.7
+pysam==0.22.1
+biopython==1.81
+numpy==1.26.4
 dash==2.17.1
 dash-bootstrap-components==1.6.0
-dash-core-components==2.0.0
-dash-html-components==2.0.0
 dash-iconify==0.1.2
-dash-table==5.0.0
-Flask==3.0.3
-itsdangerous==2.2.0
-Jinja2==3.1.4
-kombu==5.4.2
-MarkupSafe==2.1.5
-numpy==1.26.4
-packaging @ file:///home/conda/feedstock_root/build_artifacts/packaging_1718189413536/work
-pandas @ file:///home/conda/feedstock_root/build_artifacts/pandas_1715897630316/work
+dash_dangerously_set_inner_html==0.0.2
 plotly==5.22.0
-pysam==0.22.1
-python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/python-dateutil_1709299778482/work
-pytz @ file:///home/conda/feedstock_root/build_artifacts/pytz_1706886791323/work
+pandas==2.2.1
+celery==5.4.0
 PyYAML==6.0.2
-requests @ file:///home/conda/feedstock_root/build_artifacts/requests_1717057054362/work
-retrying==1.3.4
-six @ file:///home/conda/feedstock_root/build_artifacts/six_1620240208055/work
-tenacity==8.5.0
-vine==5.1.0
-Werkzeug==3.0.3
+ansi2html==1.9.2
