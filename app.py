@@ -1,4 +1,6 @@
 import pysam
+import sys
+import threading
 from Bio import SeqIO
 from Bio.Seq import Seq
 import os
@@ -9,6 +11,7 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
+import dash_dangerously_set_inner_html
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.colors
@@ -21,9 +24,24 @@ from functools import lru_cache
 from celery import Celery
 import yaml
 import zipfile
+from ansi2html import Ansi2HTMLConverter
+from itertools import islice
+import re
 
-#### START SETUP  ###################################################################################################
-#####################################################################################################################
+
+from tasks import celery_app, run_mapdamage_task, run_centrifuge_task
+
+###############################################################################################
+
+ ######  ########    ###    ########  ########    ######  ######## ######## ##     ## ########  
+##    ##    ##      ## ##   ##     ##    ##      ##    ## ##          ##    ##     ## ##     ## 
+##          ##     ##   ##  ##     ##    ##      ##       ##          ##    ##     ## ##     ## 
+ ######     ##    ##     ## ########     ##       ######  ######      ##    ##     ## ########  
+      ##    ##    ######### ##   ##      ##            ## ##          ##    ##     ## ##        
+##    ##    ##    ##     ## ##    ##     ##      ##    ## ##          ##    ##     ## ##        
+ ######     ##    ##     ## ##     ##    ##       ######  ########    ##     #######  ##
+
+###############################################################################################
 
 try:
     with open('config.yaml', 'r') as f:
@@ -34,7 +52,7 @@ except FileNotFoundError:
 default_centrifuge_db_path = config.get('centrifuge_db_path', '')
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SOLAR, "/assets/custom.css"], suppress_callback_exceptions=True) # general dash theme, can be changed but colors need to be adjusted accordingly (if you want a pretty dashboard)
-celery_app = Celery('tasks', broker='redis://localhost:6379/0')
+
 
 # custom temp directory for storing the data (needs better implementation, but works fine)
 CUSTOM_TEMP_DIR = tempfile.mkdtemp()
@@ -62,17 +80,27 @@ colors = {
 
 
 
+#################################################################
 
+##     ## ######## ##       ########  ######## ########   ######  
+##     ## ##       ##       ##     ## ##       ##     ## ##    ## 
+##     ## ##       ##       ##     ## ##       ##     ## ##       
+######### ######   ##       ########  ######   ########   ######  
+##     ## ##       ##       ##        ##       ##   ##         ## 
+##     ## ##       ##       ##        ##       ##    ##  ##    ## 
+##     ## ######## ######## ##        ######## ##     ##  ######
 
-
-#### HELPER FUNCTIONS ###############################################################################################
-#####################################################################################################################
+#################################################################
 
 def rgb_to_hex(rgb):
     """Convert an RGB tuple to a hex string, rounding the values to integers - small unnecessary helper function"""
     return '#{:02x}{:02x}{:02x}'.format(int(round(rgb[0])), int(round(rgb[1])), int(round(rgb[2])))
 
 def prepare_histogram_data(read_lengths):
+    if not read_lengths:
+        # If read_lengths is empty, return empty arrays
+        return np.array([]), np.array([]), np.array([])
+
     lengths = [length for length, _, _, _, _, _ in read_lengths]
     bins = np.arange(min(lengths), max(lengths) + 1, 1)
     hist, bin_edges = np.histogram(lengths, bins=bins)
@@ -80,12 +108,91 @@ def prepare_histogram_data(read_lengths):
     return bin_centers, hist, bins
 
 
+def save_uploaded_file(content, filename):
+    import base64
+    content_type, content_string = content.split(',')
+    decoded = base64.b64decode(content_string)
+    temp_dir = os.path.join(CUSTOM_TEMP_DIR, 'uploads')
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, filename)
+    with open(file_path, 'wb') as f:
+        f.write(decoded)
+    return file_path
 
 
 
+def parse_misincorporation(file_path):
+    df = pd.read_csv(file_path, sep='\t', comment='#')
+    return df
 
-#### FILE FUNCTIONS #################################################################################################
-#####################################################################################################################
+def parse_dnacomp(file_path):
+    df = pd.read_csv(file_path, sep='\t', comment='#')
+    return df
+
+def create_misincorporation_plot(df):
+    # Filter data as needed
+    df = df[df['End'] == '5p']
+    fig = go.Figure()
+    mutations = ['C>T', 'G>A', 'A>G', 'T>C']
+    for mut in mutations:
+        fig.add_trace(go.Scatter(
+            x=df['Pos'],
+            y=df[mut],
+            mode='lines',
+            name=mut
+        ))
+    fig.update_layout(
+        title='Misincorporation Pattern',
+        xaxis_title='Position',
+        yaxis_title='Frequency',
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted'])
+    )
+    return fig
+
+def create_dnacomp_plot(df):
+    fig = go.Figure()
+    bases = ['A', 'C', 'G', 'T']
+    for base in bases:
+        fig.add_trace(go.Scatter(
+            x=df['Pos'],
+            y=df[base],
+            mode='lines',
+            name=base
+        ))
+    fig.update_layout(
+        title='DNA Composition',
+        xaxis_title='Position',
+        yaxis_title='Frequency',
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted'])
+    )
+    return fig
+
+def display_certainty_metrics(mcmc_df):
+    misincorporation_rate = mcmc_df['delta'].iloc[0]
+    fragmentation_rate = mcmc_df['lambda'].iloc[0]
+
+    return html.Div([
+        html.H4("Certainty Metrics"),
+        html.P(f"Misincorporation Rate (delta): {misincorporation_rate:.4f}"),
+        html.P(f"Fragmentation Rate (lambda): {fragmentation_rate:.4f}")
+    ])
+
+
+################################
+
+########  #### ##       ########
+##         ##  ##       ##      
+##         ##  ##       ##      
+########   ##  ##       ######  
+##         ##  ##       ##      
+##         ##  ##       ##      
+##        #### ######## ########
+
+################################
 
 def process_uploaded_file(content, filename):
     file_ext = filename.split('.')[-1].lower()
@@ -117,10 +224,63 @@ def process_uploaded_file(content, filename):
 
     return temp_file_path, file_format
 
+def export_selected_reads(
+    read_lengths, selected_lengths, selected_cg_content, output_file_path,
+    original_file_path, file_format, selected_nm=None, filter_ct=None, exact_ct_changes=None
+):
+    if file_format in ['bam', 'sam']:
+        with pysam.AlignmentFile(original_file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as bamfile:
+            header = bamfile.header.to_dict()
+
+        # Retain all references in the header to avoid mismatch errors
+        with pysam.AlignmentFile(output_file_path, "wb" if file_format == 'bam' else "w", header=header) as outputfile:
+            for length, cg, nm, seq, read, mapq in read_lengths:
+                deamination_pattern = get_deamination_pattern(read)
+                ct_changes = count_ct_changes(read)
+
+                # Apply filters based on C>T changes
+                if filter_ct is not None:
+                    has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
+                    if filter_ct and not has_ct:
+                        continue
+                    elif not filter_ct and has_ct:
+                        continue
+
+                # Apply NM filter
+                if selected_nm is not None and selected_nm != 'all' and nm != selected_nm:
+                    continue
+
+                # Apply exact C>T changes filter
+                if exact_ct_changes is not None and ct_changes != exact_ct_changes:
+                    continue
+
+                # Apply selected lengths filter
+                if selected_lengths and length not in selected_lengths:
+                    continue  # Skip this read
+
+                # Apply selected CG content filter (if applicable)
+                if selected_cg_content and cg not in selected_cg_content:
+                    continue  # Skip this read
+
+                outputfile.write(read)
+    else:
+        with open(output_file_path, "w") as outputfile:
+            for length, cg, _, seq, record in read_lengths:
+                # Apply selected lengths filter
+                if selected_lengths and length not in selected_lengths:
+                    continue  # Skip this record
+
+                # Apply selected CG content filter (if applicable)
+                if selected_cg_content and cg not in selected_cg_content:
+                    continue  # Skip this record
+
+                SeqIO.write(record, outputfile, file_format)
+
+
 
 # cached results of file-processing to avoid reloading the data, but not strictly necessary
 @lru_cache(maxsize=100)
-def load_and_process_file(file_content, filename, selected_nm, filter_ct, ct_count_value, ct_checklist_tuple, mapq_range):
+def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range):
     temp_file_path, file_format = process_uploaded_file(file_content, filename)
     deduped_file_path = os.path.join(
         CUSTOM_TEMP_DIR, f"deduped_{uuid.uuid4()}_{filename}"
@@ -138,7 +298,12 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, ct_cou
         ]
         
         if filter_ct is not None:
+            # Filter reads that have at least one C>T or G>A change
             read_lengths = [r for r in read_lengths if ('C>T' in get_deamination_pattern(r[4]) or 'G>A' in get_deamination_pattern(r[4])) == filter_ct]
+
+        if exclusively_ct:
+            # Keep reads where all mismatches are C>T or G>A
+            read_lengths = [r for r in read_lengths if has_only_ct_mismatches(r[4])]
 
         # First, adjust NM values if subtract_ct is selected
         if 'subtract_ct' in ct_checklist_tuple:
@@ -153,6 +318,7 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, ct_cou
             read_lengths = [r for r in read_lengths if r[2] == selected_nm]
 
     return read_lengths, file_format, deduped_file_path
+
 
 
 def remove_duplicates_with_strand_check(input_file, output_file, file_format):
@@ -206,10 +372,17 @@ def remove_duplicates_with_strand_check(input_file, output_file, file_format):
 
 
 
+#####################################################################
 
+########  ##        #######  ######## ######## #### ##    ##  ######  
+##     ## ##       ##     ##    ##       ##     ##  ###   ## ##    ## 
+##     ## ##       ##     ##    ##       ##     ##  ####  ## ##       
+########  ##       ##     ##    ##       ##     ##  ## ## ## ##   ####
+##        ##       ##     ##    ##       ##     ##  ##  #### ##    ## 
+##        ##       ##     ##    ##       ##     ##  ##   ### ##    ## 
+##        ########  #######     ##       ##    #### ##    ##  ######
 
-#### PLOT FUNCTIONS #################################################################################################
-#####################################################################################################################
+#####################################################################
 
 def get_mismatches(read):
     mismatches = []
@@ -315,6 +488,36 @@ def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
             filtered_mismatches.append(mismatch)
     return filtered_mismatches
 
+def has_only_ct_mismatches(read):
+    if read.is_unmapped:
+        return False  # Unmapped reads cannot be considered
+
+    mismatches = []
+    for q_pos, r_pos, ref_base in read.get_aligned_pairs(with_seq=True):
+        if q_pos is not None and ref_base is not None:
+            read_base = read.query_sequence[q_pos].upper()
+            ref_base = ref_base.upper()
+            if read_base != ref_base:
+                mismatches.append({'ref_base': ref_base, 'read_base': read_base})
+
+    if not mismatches:
+        return False  # No mismatches
+
+    for mismatch in mismatches:
+        ref_base = mismatch['ref_base']
+        read_base = mismatch['read_base']
+        if read.is_reverse:
+            # Reverse strand: G>A corresponds to C>T on reverse strand
+            if not (ref_base == 'G' and read_base == 'A'):
+                return False
+        else:
+            # Forward strand
+            if not (ref_base == 'C' and read_base == 'T'):
+                return False
+
+    return True  # All mismatches are C>T or G>A
+
+
 
 
 def categorize_mismatches(mismatches): # have to check whether this makes sense
@@ -387,7 +590,7 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
         name=f'{selected_file} Read Count',
         opacity=1,
         hovertemplate='%{x}: %{y}<extra></extra>',
-        marker_color=colors['line']
+        marker_color=colors['line'],
     ))
 
     
@@ -417,6 +620,7 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
 
     read_length_fig.update_layout(
         title=dict(text='Read Length Distribution with Average CG Content', font=dict(color=colors['muted'])),
+        uirevision='read_length',
         xaxis=dict(title='Read Length', color=colors['muted'], tickfont=dict(color=colors['muted'])),
         yaxis=dict(
             title=dict(text='Read Count', font=dict(color='#1CA8FF')),
@@ -539,7 +743,8 @@ def create_detailed_mismatch_pie_chart(stats):
         'A': plotly.colors.sequential.Blues,
         'C': plotly.colors.sequential.Oranges,
         'G': plotly.colors.sequential.Greens,
-        'T': plotly.colors.sequential.Reds_r # otherwise not really visible
+        'T': plotly.colors.sequential.Reds_r,
+        'N': plotly.colors.sequential.solar # otherwise not really visible
     }
     
     # Assign colors to each mismatch type
@@ -743,6 +948,35 @@ def create_mismatch_frequency_plot(frequencies):
 
     return fig
 
+def display_mapdamage_results(output_dir):
+    try:
+        # Parse misincorporation data
+        misincorporation_df = parse_misincorporation(os.path.join(output_dir, 'misincorporation.txt'))
+        # Create misincorporation plot
+        misincorporation_fig = create_misincorporation_plot(misincorporation_df)
+
+        # Parse DNA composition data
+        dnacomp_df = parse_dnacomp(os.path.join(output_dir, 'dnacomp.txt'))
+        dnacomp_fig = create_dnacomp_plot(dnacomp_df)
+
+        # Display certainty metrics if available
+        metrics_content = []
+        mcmc_path = os.path.join(output_dir, 'Stats_out_MCMC.csv')
+        if os.path.exists(mcmc_path):
+            mcmc_df = pd.read_csv(mcmc_path)
+            metrics_content.append(display_certainty_metrics(mcmc_df))
+
+        return html.Div([
+            html.H4("Misincorporation Plot"),
+            dcc.Graph(figure=misincorporation_fig),
+            html.H4("DNA Composition Plot"),
+            dcc.Graph(figure=dnacomp_fig),
+            *metrics_content
+        ])
+    except Exception as e:
+        return html.Div(f"Error processing mapDamage2 results: {e}", className="text-danger")
+
+
 def get_damage_patterns(file_path, file_format, filter_ct=None):
     five_prime_end = []
     three_prime_end = []
@@ -829,40 +1063,7 @@ def adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value): # for f
     
     return adjusted_read_lengths
 
-def export_selected_reads(read_lengths, selected_lengths, selected_cg_content, output_file_path, original_file_path, file_format, selected_nm=None, filter_ct=None, exact_ct_changes=None):
-    if file_format in ['bam', 'sam']:
-        with pysam.AlignmentFile(original_file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as bamfile:
-            header = bamfile.header.to_dict()
 
-        # Retain all references in the header to avoid mismatch errors
-        with pysam.AlignmentFile(output_file_path, "wb" if file_format == 'bam' else "w", header=header) as outputfile:
-            for length, cg, nm, seq, read, mapq in read_lengths:
-                deamination_pattern = get_deamination_pattern(read)
-                ct_changes = count_ct_changes(read)
-
-                if filter_ct is not None:
-                    has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
-                    if filter_ct and not has_ct:
-                        continue
-                    elif not filter_ct and has_ct:
-                        continue
-
-                if selected_nm is not None and selected_nm != 'all' and nm != selected_nm:
-                    continue
-
-                if exact_ct_changes is not None and ct_changes != exact_ct_changes:
-                    continue
-
-                if (selected_lengths and length not in selected_lengths) or (selected_cg_content and cg not in selected_cg_content):
-                    continue
-
-                outputfile.write(read)
-    else:
-        with open(output_file_path, "w") as outputfile:
-            for length, cg, _, seq, record in read_lengths:
-                if (selected_lengths and length not in selected_lengths) or (selected_cg_content and cg not in selected_cg_content):
-                    continue
-                SeqIO.write(record, outputfile, file_format)
 
 def get_read_length_data(read_lengths):
     lengths = [length for length, _, _, _, _, _ in read_lengths]
@@ -999,10 +1200,17 @@ def create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 
 
 
+########################################################
 
+##          ###    ##    ##  #######  ##     ## ######## 
+##         ## ##    ##  ##  ##     ## ##     ##    ##    
+##        ##   ##    ####   ##     ## ##     ##    ##    
+##       ##     ##    ##    ##     ## ##     ##    ##    
+##       #########    ##    ##     ## ##     ##    ##    
+##       ##     ##    ##    ##     ## ##     ##    ##    
+######## ##     ##    ##     #######   #######     ##
 
-#### DASHBOARD LAYOUT ###############################################################################################
-#####################################################################################################################
+#######################################################
 
 settings_offcanvas = dbc.Offcanvas(
     [
@@ -1239,6 +1447,29 @@ settings_offcanvas = dbc.Offcanvas(
     style={"width": "450px", "background-color": colors['surface'], "color": colors['muted']}
 )
 
+# Console Offcanvas
+console_offcanvas = dbc.Offcanvas(
+    [
+        html.H5("Console Log", className="mb-3", style={"color": colors['muted']}),
+        html.Div(id='console-log', className='console-log', style={
+            'whiteSpace': 'pre-wrap',
+            'height': '100%',
+            'overflowY': 'scroll',
+            'backgroundColor': colors['background'],
+            'padding': '10px',
+            'border': f'1px solid {colors["muted"]}',
+            'borderRadius': '4px',
+            'fontFamily': 'monospace'
+        })
+    ],
+    id="console-offcanvas",
+    title="Console Log",
+    placement="end",
+    is_open=False,
+    style={"width": "900px", "backgroundColor": colors['surface']}
+)
+
+
 
 #old header
 def create_header():
@@ -1256,11 +1487,173 @@ def create_header():
         ], className="header-row")
     ], fluid=True, className="header-container")
 
+layout_file_viewer = dbc.Container([
+    dbc.Row([
+        dbc.Col([
+            html.H2("File Viewer", className="card-title mb-4"),
+            dbc.Card([
+                dbc.CardBody([
+                    # File Selection Dropdown
+                    dcc.Dropdown(
+                        id='viewer-file-selector',
+                        options=[],  # Will be populated dynamically
+                        value=None,
+                        clearable=False,
+                        placeholder="Select a file to view",
+                        className="mb-3",
+                        style={"width": "100%"}
+                    ),
+
+                    # Filtering Options Section
+                    dbc.Accordion([
+                        dbc.AccordionItem([
+                            html.Div([
+                                html.Label("Mapping Quality (MAPQ) Range:", className="mb-2"),
+                                dcc.RangeSlider(
+                                    id='viewer-mapq-range',
+                                    min=0,
+                                    max=255,
+                                    step=1,
+                                    value=[0, 255],
+                                    marks={i: {'label': str(i), 'style': {'color': colors['muted']}} for i in range(0, 256, 25)},
+                                    tooltip={"placement": "bottom", "always_visible": True},
+                                    updatemode='drag',
+                                    className="mb-3",
+                                ),
+                                dbc.Label("Minimum Base Quality: ", className="mt-3"),
+                                dcc.Input(
+                                    id='viewer-min-base-quality',
+                                    type='number',
+                                    value=20,
+                                    className="mb-3",
+                                    style={
+                                        "background-color": colors['surface'],
+                                        "color": colors['on_surface'],
+                                        "border": f"1px solid {colors['muted']}",
+                                        "width": "100%"
+                                    }
+                                ),
+                                html.Label("Mismatch Filter (BAM/SAM only):", className="mb-2"),
+                                dcc.Dropdown(
+                                    id='viewer-nm-dropdown',
+                                    options=[
+                                        {'label': 'All Reads', 'value': 'all'},
+                                        {'label': 'NM:i:0', 'value': 0},
+                                        {'label': 'NM:i:1', 'value': 1},
+                                        {'label': 'NM:i:2', 'value': 2},
+                                        {'label': 'NM:i:3', 'value': 3},
+                                        {'label': 'NM:i:4', 'value': 4},
+                                        {'label': 'NM:i:5', 'value': 5}
+                                    ],
+                                    value='all',
+                                    clearable=False,
+                                    className="mb-3",
+                                ),
+                                html.Label("C>T Change Filter:", className="mb-2"),
+                                dcc.Checklist(
+                                    id='viewer-ct-checklist',
+                                    options=[
+                                        {'label': ' Show only reads with C>T changes', 'value': 'only_ct'},
+                                        {'label': ' Show reads with only C>T changes', 'value': 'exclusively_ct'},
+                                        {'label': ' Exclude C>T changed reads', 'value': 'exclude_ct'},
+                                        {'label': ' Subtract C>T changes from NM', 'value': 'subtract_ct'}
+                                    ],
+                                    value=[],
+                                    className="mb-3",
+                                ),
+                                html.Label("C>T Change Count:", className="mb-2"),
+                                dcc.Dropdown(
+                                    id='viewer-ct-count-dropdown',
+                                    options=[
+                                        {'label': 'Any', 'value': 'any'},
+                                        {'label': 'One', 'value': 1},
+                                        {'label': 'Two', 'value': 2},
+                                        {'label': 'Three', 'value': 3},
+                                        {'label': 'Four', 'value': 4},
+                                        {'label': 'Five', 'value': 5}
+                                    ],
+                                    value='any',
+                                    clearable=False,
+                                    className="mb-4",
+                                ),
+                            ])
+                        ], title="Filtering Options", style={"background-color": colors['surface'], "color": colors['on_surface']})
+                    ], start_collapsed=True, className="mb-4"),
+
+                    # Navigation Controls and Search Options
+                    html.Div([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.InputGroup([
+                                    dbc.Input(id='viewer-search-input', placeholder='Search by read name...', size="sm"),
+                                    dbc.Button('Search', id='viewer-search-button', n_clicks=0, size="sm")
+                                ], size="sm"),
+                            ], width=3, className="mb-3 mb-sm-0"),
+                            dbc.Col([
+                                dbc.InputGroup([
+                                    dbc.Input(id='viewer-sequence-search-input', placeholder='Search by sequence...', size="sm"),
+                                    dbc.Button('Search', id='viewer-sequence-search-button', n_clicks=0, size="sm")
+                                ], size="sm"),
+                            ], width=3, className="mb-3 mb-sm-0"),
+                            dbc.Col([
+                                dbc.InputGroup([
+                                    dbc.InputGroupText("Sort by"),
+                                    dbc.Select(
+                                        id='viewer-sort-field',
+                                        options=[
+                                            {'label': 'Name', 'value': 'name'},
+                                            {'label': 'Length', 'value': 'length'},
+                                            {'label': 'Mismatches', 'value': 'mismatches'}
+                                        ],
+                                        value='name',
+                                        size="sm",  # Use bs_size instead of size
+                                    ),
+                                    dbc.InputGroupText("Order"),
+                                    dbc.Select(
+                                        id='viewer-sort-order',
+                                        options=[
+                                            {'label': '↑', 'value': 'asc'},
+                                            {'label': '↓', 'value': 'desc'}
+                                        ],
+                                        value='asc',
+                                        size="sm",  # Use bs_size instead of size
+                                    ),
+                                ], size="sm"),
+                            ], width=4, className="mb-3 mb-sm-0"),
+                            dbc.Col([
+                                dbc.InputGroup([
+                                    dbc.Input(id='viewer-page-input', type='number', min=1, placeholder='Page', size="sm"),
+                                    dbc.Button('Go', id='viewer-go-button', n_clicks=0, size="sm", className="me-2"),
+                                    dbc.Button("←", id='viewer-prev-button', n_clicks=0, disabled=True, size="sm", className="me-2"),
+                                    dbc.Button("→", id='viewer-next-button', n_clicks=0, disabled=False, size="sm"),
+                                ], size="sm"),
+                            ], width=2),
+                        ], className="g-2 align-items-center"),
+                        html.Div(id='viewer-page-info', className="mt-2 text-muted small"),
+                    ], className="mb-4"),
+
+
+                    # File Viewer Content
+                    dcc.Loading(
+                        id="loading-viewer",
+                        type="circle",
+                        children=html.Div(id='file-viewer-content', style={"max-height": "1000px", "overflow": "auto", "padding": "10px", "background-color": colors['surface'], "border-radius": "4px"})
+                    ),
+
+                    dcc.Store(id='viewer-page-index', data=0),
+                ])
+            ], className="mb-4")
+        ], width=11),
+    ], justify='center'),
+], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
+
+
+
 
 # Define the Navbar separately for reuse 
 navbar = dbc.Navbar(
     dbc.Container([
-        html.A(
+        dcc.Link(
             dbc.Row([
                 dbc.Col(DashIconify(icon="mdi:dna", width=40, color=colors['secondary'])),
                 dbc.Col(dbc.NavbarBrand("GRAFT", className="ms-2")),
@@ -1271,27 +1664,43 @@ navbar = dbc.Navbar(
             href="/",
             style={"textDecoration": "none"},
         ),
+        dbc.NavItem(dbc.Button("Console", id="console-button", color="light", outline=True, className="me-2")),
         dbc.NavbarToggler(id="navbar-toggler"),
         dbc.Collapse(
             dbc.Nav([
-                dbc.NavItem(dbc.NavLink("Home", href="/")),
-                dbc.NavItem(dbc.NavLink("Convert", href="/convert")),
+                dbc.NavItem(dcc.Link("Home", href="/", className="nav-link")),
+                dbc.NavItem(dcc.Link("Convert", href="/convert", className="nav-link")),
+                dbc.NavItem(dcc.Link("File Viewer", href="/file-viewer", className="nav-link")), 
                 dbc.NavItem(dbc.Button("Settings", id="settings-button", color="light", outline=True)),
-            ], className="ms-auto", navbar=True),  # Align to the right
+            ], className="ms-auto", navbar=True),
             id="navbar-collapse",
             navbar=True,
         ),
+        console_offcanvas,
     ]),
     color=colors['surface'],
     dark=True,
     className="mb-4",
 )
 
+
+
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     navbar,
     html.Div(id='page-content'),
+    # Stores and Download components
+    dcc.Store(id='file-store', data={'files': []}),
+    dcc.Store(id='selected-lengths', data=[]),
+    dcc.Store(id='read-length-selection-store'),
+    dcc.Store(id='selected-cg-contents', data=[]),
+    dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
+    dcc.Interval(id='console-interval', interval=2000, n_intervals=0),
+    dcc.Store(id='centrifuge-task-id'),
+    dcc.Store(id='centrifuge-output-path'),
+    dcc.Download(id="download-file"),
 ])
+
 
 
 # Converter Page Layout
@@ -1333,8 +1742,6 @@ layout_convert = dbc.Container([
 
 
 layout_main = dbc.Container([
-
-
     # Main content
     dbc.Row([
         # Sidebar
@@ -1370,12 +1777,12 @@ layout_main = dbc.Container([
                         value=20,
                         className="mb-3",
                         style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
+                            "background-color": colors['surface'],
+                            "color": colors['on_surface'],
+                            "border": f"1px solid {colors['muted']}",
+                            "width": "100%",
+                            "margin-bottom": "10px"
+                        }
                     ),
                     html.Label("Mismatch Filter (BAM/SAM only):", className="mb-2"),
                     dcc.Dropdown(
@@ -1397,7 +1804,8 @@ layout_main = dbc.Container([
                     dcc.Checklist(
                         id='ct-checklist',
                         options=[
-                            {'label': ' Show only C>T changes', 'value': 'only_ct'},
+                            {'label': ' Show only reads with C>T changes', 'value': 'only_ct'},
+                            {'label': ' Show reads with only C>T changes', 'value': 'exclusively_ct'},
                             {'label': ' Exclude C>T changed reads', 'value': 'exclude_ct'},
                             {'label': ' Subtract C>T changes from NM', 'value': 'subtract_ct'}
                         ],
@@ -1419,7 +1827,6 @@ layout_main = dbc.Container([
                         clearable=False,
                         className="mb-4",
                     ),
-                    # dbc.Button("Apply Filters (?)", id="apply-filters-button", color="primary", className="w-100 mb-3"),
                     dbc.Button("Run Centrifuge Analysis", id="centrifuge-button", color="primary", className="w-100 mb-3"),
                     dcc.Loading(
                         id="loading-centrifuge",
@@ -1429,49 +1836,99 @@ layout_main = dbc.Container([
                     dbc.Button("Export Selected Reads", id="export-button", color="secondary", className="w-100 mb-3"),
                     dbc.Button("Show Alignment Statistics", id="stats-button", color="info", className="w-100 mb-3"),
                     dbc.Button("Clear Selection", id="clear-selection-button", outline=True, color="danger", className="w-100"),
-                    
                 ])
             ], className="sticky-top")
         ], width=3, className="mb-4"),
 
         # Main content area
         dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H2("Upload Files", className="card-title mb-4", id="upload"),
-                    dcc.Upload(
-                        id='upload-data',
-                        children=html.Div([
-                            DashIconify(icon="mdi:cloud-upload", width=64, color=colors['secondary']),
-                            html.Div("Drag and Drop or Click to Select Files", className="mt-2"),
-                            html.Div("Supported formats: BAM, SAM, FASTA, FASTQ", className="text-muted"),
-                        ]),
-                        multiple=True,
-                        className="upload-box",
-                    ),
-                ])
-            ], className="mb-4"),
-
-            dbc.Card([
-                dbc.CardBody([
-                    html.H2("Analysis Results", className="card-title mb-4", id="analyze"),
-                    dcc.Loading(
-                        id="loading-graphs",
-                        type="circle",
-                        children=dbc.Tabs([
-                            dbc.Tab(dcc.Graph(id='read-length-histogram'), label="Read Length"),
-                            dbc.Tab(dcc.Graph(id='overall-cg-histogram'), label="Overall CG"),
-                            dbc.Tab(dcc.Graph(id='cg-content-histogram'), label="CG Distribution"),
-                            dbc.Tab(dcc.Graph(id='damage-patterns'), label="Damage Patterns"),
-                            dbc.Tab(dcc.Graph(id='mismatch-frequency-plot'), label="Mismatch Frequency"),
-                            dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart'), label="Mismatch Types"),
-                            dbc.Tab(dcc.Graph(id='damage-pattern-plot'), label="Damage Patterns Along Reads"),
-                            dbc.Tab(dcc.Graph(id='mapq-histogram'), label="MAPQ Distribution"),
-                            dbc.Tab(html.Pre(id='data-summary', style={'whiteSpace': 'pre-wrap'}), label="Data Summary"),
-                        ]),
-                    ),
-                ])
+            dbc.Row([
+                # Upload Files Section
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardBody([
+                            html.H2("Upload Files", className="card-title mb-4", id="upload"),
+                            dcc.Upload(
+                                id='upload-data',
+                                children=html.Div([
+                                    DashIconify(icon="mdi:cloud-upload", width=64, color=colors['secondary']),
+                                    html.Div("Drag and Drop or Click to Select Files", className="mt-2"),
+                                    html.Div("Supported formats: BAM, SAM, FASTA, FASTQ", className="text-muted"),
+                                ]),
+                                multiple=True,
+                                className="upload-box",
+                            ),
+                        ])
+                    ], className="mb-4")
+                ], width=12),
             ]),
+
+            dbc.Row([
+                # Analysis Results Section
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardBody([
+                            html.H2("Analysis Results", className="card-title mb-4", id="analyze"),
+                            dcc.Loading(
+                                id="loading-graphs",
+                                type="circle",
+                                children=dbc.Tabs([
+                                    dbc.Tab(dcc.Graph(id='read-length-histogram'), label="Read Length"),
+                                    dbc.Tab(dcc.Graph(id='overall-cg-histogram'), label="Overall CG"),
+                                    dbc.Tab(dcc.Graph(id='cg-content-histogram'), label="CG Distribution"),
+                                    dbc.Tab(dcc.Graph(id='damage-patterns'), label="Damage Patterns"),
+                                    dbc.Tab(dcc.Graph(id='mismatch-frequency-plot'), label="Mismatch Frequency"),
+                                    dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart'), label="Mismatch Types"),
+                                    dbc.Tab(dcc.Graph(id='damage-pattern-plot'), label="Damage Patterns Along Reads"),
+                                    dbc.Tab(dcc.Graph(id='mapq-histogram'), label="MAPQ Distribution"),
+                                    dbc.Tab(html.Pre(id='data-summary', style={'whiteSpace': 'pre-wrap'}), label="Data Summary"),
+                                ]),
+                            ),
+                        ])
+                    ], className="mb-4")
+                ], width=12),
+            ]),
+
+            dbc.Row([
+                # MapDamage2 Analysis Section
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardBody([
+                            html.H2("mapDamage2 Analysis", className="card-title mb-4"),
+                            html.Label("Select BAM File:", className="mb-2"),
+                            dcc.Dropdown(
+                                id='mapdamage-bam-selector',
+                                options=[],  # Will be populated dynamically
+                                value=None,
+                                clearable=False,
+                                placeholder="Select a BAM file",
+                                className="mb-4",
+                            ),
+                            html.Label("Select Reference Genome (FASTA):", className="mb-2"),
+                            dcc.Dropdown(
+                                id='mapdamage-ref-selector',
+                                options=[],  # Will be populated dynamically
+                                value=None,
+                                clearable=False,
+                                placeholder="Select a reference genome",
+                                className="mb-4",
+                            ),
+                            dbc.Button("Run mapDamage2 Analysis", id="run-mapdamage-button", color="primary"),
+                            html.Div(id="mapdamage-status", className="mt-3"),
+                            dcc.Loading(
+                                id="loading-mapdamage",
+                                type="circle",
+                                children=[
+                                    html.Div(id='mapdamage-output')
+                                ]
+                            ),
+                            dcc.Interval(id='mapdamage-interval', interval=5000, n_intervals=0, disabled=True),
+                            dcc.Store(id='mapdamage-task-id'),
+                            dcc.Store(id='mapdamage-output-dir'),
+                        ])
+                    ])
+                ], width=12),
+            ])
         ], width=9),
     ]),
 
@@ -1487,15 +1944,24 @@ layout_main = dbc.Container([
     # Settings offcanvas
     settings_offcanvas,
 
-    # Stores and Download component
-    dcc.Store(id='file-store', data={'files': []}),
-    dcc.Store(id='selected-lengths', data=[]),
-    dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
-    dcc.Store(id='centrifuge-task-id'),
-    dcc.Store(id='centrifuge-output-path'),
-    dcc.Download(id="download-file"),
+    # # Stores and Download component
+    # dcc.Store(id='file-store', data={'files': []}),
+    # dcc.Store(id='selected-lengths', data=[]),
+    # dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
+    # dcc.Interval(id='console-interval', interval=2000, n_intervals=0),
+    # dcc.Store(id='centrifuge-task-id'),
+    # dcc.Store(id='centrifuge-output-path'),
+    # dcc.Download(id="download-file"),
 
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
+
+app.validation_layout = html.Div([
+    app.layout,
+    layout_main,
+    layout_convert,
+    layout_file_viewer
+])
+
 
 # Add custom CSS, have to merge with external assets css
 app.index_string = '''
@@ -1522,6 +1988,12 @@ app.index_string = '''
             }
             .nav-link:hover {
                 color: ''' + colors['on_surface'] + ''' !important;
+            }
+            .console-log pre {
+                background-color: transparent;
+                color: inherit;
+                font-family: monospace;
+                white-space: pre-wrap;
             }
             .upload-box {
                 border: 2px dashed ''' + colors['secondary'] + ''';
@@ -1564,19 +2036,408 @@ app.index_string = '''
 
 
 
+###################################################################################
+
+ ######     ###    ##       ##       ########     ###     ######  ##    ##  ######  
+##    ##   ## ##   ##       ##       ##     ##   ## ##   ##    ## ##   ##  ##    ## 
+##        ##   ##  ##       ##       ##     ##  ##   ##  ##       ##  ##   ##       
+##       ##     ## ##       ##       ########  ##     ## ##       #####     ######  
+##       ######### ##       ##       ##     ## ######### ##       ##  ##         ## 
+##    ## ##     ## ##       ##       ##     ## ##     ## ##    ## ##   ##  ##    ## 
+ ######  ##     ## ######## ######## ########  ##     ##  ######  ##    ##  ######
+
+##################################################################################
 
 
-##### CALLBACK FUNCTIONS ############################################################################################
-#####################################################################################################################
+################### FILE VIEWER ##################
+
+@app.callback(
+    Output('viewer-ct-checklist', 'value'),
+    [Input('viewer-ct-checklist', 'value')]
+)
+def enforce_mutual_exclusivity(selected_values):
+    if len(selected_values) > 1:
+        # Keep only the last selected option
+        return [selected_values[-1]]
+    else:
+        return selected_values
+
+
 
 @app.callback(Output('page-content', 'children'),
               [Input('url', 'pathname')])
-
 def display_page(pathname):
     if pathname == '/convert':
         return layout_convert
+    elif pathname == '/file-viewer':
+        return layout_file_viewer  # New File Viewer layout
     else:
         return layout_main
+
+@app.callback(
+    Output('viewer-file-selector', 'options'),
+    [Input('file-store', 'data')]
+)
+def update_viewer_file_selector(store_data):
+    files = store_data.get('files', [])
+    options = [{'label': f['filename'], 'value': f['filename']} for f in files]
+    return options
+
+@app.callback(
+    [
+        Output('file-viewer-content', 'children'),
+        Output('viewer-prev-button', 'disabled'),
+        Output('viewer-next-button', 'disabled'),
+        Output('viewer-page-info', 'children'),
+        Output('viewer-page-index', 'data')
+    ],
+    [
+        Input('viewer-file-selector', 'value'),
+        Input('viewer-prev-button', 'n_clicks'),
+        Input('viewer-next-button', 'n_clicks'),
+        Input('viewer-go-button', 'n_clicks'),
+        Input('viewer-search-button', 'n_clicks'),
+        Input('viewer-mapq-range', 'value'),
+        Input('viewer-min-base-quality', 'value'),
+        Input('viewer-nm-dropdown', 'value'),
+        Input('viewer-ct-checklist', 'value'),
+        Input('viewer-ct-count-dropdown', 'value'),
+        Input('viewer-page-input', 'value'),
+        Input('viewer-search-input', 'value'),
+        Input('viewer-sequence-search-button', 'n_clicks'),
+        Input('viewer-sort-field', 'value'),
+        Input('viewer-sort-order', 'value'),
+    ],
+    [
+        State('viewer-sequence-search-input', 'value'),
+        State('file-store', 'data'),
+        State('viewer-page-index', 'data')
+    ]
+)
+def display_file_content(
+    selected_file,
+    prev_clicks,
+    next_clicks,
+    go_clicks,
+    search_clicks,
+    mapq_range,
+    min_base_quality,
+    selected_nm,
+    ct_checklist,
+    ct_count_value,
+    page_input_value,
+    search_input_value,
+    sequence_search_clicks,
+    sort_field,
+    sort_order,
+    sequence_search_input_value,
+    store_data,
+    page_index
+):
+    if selected_file is None:
+        return html.Div("No file selected.", className="text-muted"), True, True, "", page_index
+
+    # Retrieve the file content
+    file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
+    if file_data is None:
+        return html.Div("File not found.", className="text-muted"), True, True, "", page_index
+
+    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
+
+    ct_checklist_tuple = tuple(ct_checklist)
+
+    # Prepare C>T filters
+    filter_ct = None
+    exclusively_ct = False
+    subtract_ct = False
+    if 'only_ct' in ct_checklist_tuple:
+        filter_ct = True
+    elif 'exclude_ct' in ct_checklist_tuple:
+        filter_ct = False
+    elif 'exclusively_ct' in ct_checklist_tuple:
+        exclusively_ct = True
+    if 'subtract_ct' in ct_checklist_tuple:
+        subtract_ct = True
+    
+    mapq_range_tuple = tuple(mapq_range)
+
+    # load_and_process_file
+    read_lengths, file_format, deduped_file_path = load_and_process_file(
+        file_data['content'], file_data['filename'], selected_nm, filter_ct, exclusively_ct, ct_count_value,
+        ct_checklist_tuple, mapq_range_tuple
+    )
+
+
+    # Apply additional filters based on base quality
+    if file_format in ['bam', 'sam']:
+        filtered_reads = []
+        for length, cg, nm, seq, read, mapq in read_lengths:
+            if read.mapping_quality < mapq_range[0] or read.mapping_quality > mapq_range[1]:
+                continue
+            if min_base_quality is not None:
+                base_qualities = read.query_qualities
+                if base_qualities is not None and min(base_qualities) < min_base_quality:
+                    continue
+            filtered_reads.append((length, cg, nm, seq, read, mapq))
+        read_lengths = filtered_reads
+
+    # Implement pagination and search functionality
+    records_per_page = 20
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    # Initialize matching_indices to all reads
+    matching_indices = list(range(len(read_lengths)))
+
+    if triggered_id == 'viewer-prev-button':
+        page_index = max(0, page_index - 1)
+    elif triggered_id == 'viewer-next-button':
+        page_index = page_index + 1
+    elif triggered_id == 'viewer-go-button' and page_input_value:
+        page_index = min(max(0, page_input_value - 1), (len(read_lengths) - 1) // records_per_page)
+    elif triggered_id == 'viewer-search-button' and search_input_value:
+        # Partial name matching
+        search_name = search_input_value
+        matching_indices = [i for i, (_, _, _, _, read, _) in enumerate(read_lengths)
+                            if search_name in (read.query_name if isinstance(read, pysam.AlignedSegment) else read.id)]
+        if not matching_indices:
+            return html.Div(f"No reads found containing '{search_name}' in their names.", className="text-danger"), True, True, "", page_index
+        page_index = 0  # Reset to first page after search
+    elif triggered_id == 'viewer-sequence-search-button' and sequence_search_input_value:
+        # Sequence content search
+        search_seq = sequence_search_input_value.upper()
+        matching_indices = [i for i, (_, _, _, _, read, _) in enumerate(read_lengths)
+                            if search_seq in (read.query_sequence.upper() if isinstance(read, pysam.AlignedSegment) else str(read.seq).upper())]
+        if not matching_indices:
+            return html.Div(f"No reads found containing the sequence '{search_seq}'.", className="text-danger"), True, True, "", page_index
+        page_index = 0  # Reset to first page after search
+    else:
+        page_index = 0
+
+    # Adjust the reads to include only matching_indices
+    filtered_read_lengths = [read_lengths[i] for i in matching_indices]
+
+    # Implement sorting before pagination
+    if sort_field and sort_order:
+        if sort_field == 'name':
+            # Sort by read name
+            key_func = lambda x: x[4].query_name if isinstance(x[4], pysam.AlignedSegment) else x[4].id
+        elif sort_field == 'length':
+            # Sort by read length
+            key_func = lambda x: x[0]  # length is at index 0
+        elif sort_field == 'mismatches':
+            # Sort by number of mismatches (NM tag)
+            key_func = lambda x: x[2]  # nm is at index 2
+        else:
+            key_func = None
+
+        if key_func:
+            reverse = sort_order == 'desc'
+            filtered_read_lengths.sort(key=key_func, reverse=reverse)
+
+    # Update total_pages based on filtered reads
+    total_pages = max(1, (len(filtered_read_lengths) + records_per_page - 1) // records_per_page)
+
+    # Ensure page_index is within valid range
+    page_index = min(page_index, total_pages - 1)
+
+    start_index = page_index * records_per_page
+    end_index = start_index + records_per_page
+    page_reads = filtered_read_lengths[start_index:end_index]
+
+    # Prepare content based on file format
+    sequences = []
+    if file_format in ['fasta', 'fa', 'fna', 'fastq', 'fq']:
+        for _, _, _, _, record, _ in page_reads:
+            sequences.append(html.Div([
+                html.H5(record.id, className='sequence-header'),
+                html.Pre(str(record.seq), className='sequence-content'),
+                # For FASTQ, include qualities
+                html.Pre(str(record.letter_annotations.get("phred_quality", "")), className='sequence-quality')
+            ], className='sequence-block'))
+    elif file_format in ['bam', 'sam']:
+        for _, _, _, _, read, _ in page_reads:
+            # Retrieve reference sequence if possible
+            ref_seq = get_reference_sequence(read)
+            # Highlight mismatches
+            read_seq_html = highlight_mismatches(read)
+            # Retrieve metadata
+            metadata = read.get_tags()
+            metadata_info = ', '.join([f"{tag}:{value}" for tag, value in metadata])
+
+            sequences.append(html.Div([
+                html.Div([
+                    html.Span(read.query_name, className='sequence-header'),
+                    html.Span(f" (Flag: {read.flag}, MapQ: {read.mapping_quality})", className='alignment-info'),
+                ], className='header-row'),
+                html.Div([
+                    html.Span('Metadata:', className='sequence-label'),
+                    html.Span(metadata_info, className='metadata-info'),
+                ]),
+                html.Div([
+                    html.Span('CIGAR:', className='sequence-label'),
+                    html.Span(read.cigarstring),
+                    html.Span(' | '),
+                    html.Span('NM:', className='sequence-label'),
+                    html.Span(read.get_tag('NM')),
+                    html.Span(' | '),
+                    html.Span('MD:', className='sequence-label'),
+                    html.Span(read.get_tag('MD')),
+                ], className='metadata-info'),
+                html.Div([
+                    html.Span('Ref:', className='sequence-label'),
+                    html.Pre(ref_seq if ref_seq else 'N/A', className='reference-sequence'),
+                ]),
+                html.Div([
+                    html.Span('Read:', className='sequence-label'),
+                    read_seq_html,  # This will include highlighted mismatches
+                ]),
+            ], className='sequence-block'))
+    else:
+        return html.Div("Unsupported file format.", className="text-danger"), True, True, "", page_index
+
+    prev_disabled = page_index == 0
+    next_disabled = page_index >= total_pages - 1
+    page_info = f"Page {page_index + 1} of {total_pages}"
+
+    return html.Div(sequences), prev_disabled, next_disabled, page_info, page_index
+
+
+
+
+def get_reference_sequence(read): # quite unneccessary, was initially implemented to use if fasta refseq was available
+    if read.is_unmapped or read.reference_id < 0:
+        return None
+    # need access to the reference genome sequence
+    # Assuming you have a dictionary or function that maps reference names to sequences
+    # For example, reference_sequences = {'chr1': 'ATGCT...'}
+    ref_name = read.reference_name
+    ref_start = read.reference_start
+    ref_end = read.reference_end
+    ref_seq = reference_sequences.get(ref_name)
+    if ref_seq:
+        return ref_seq[ref_start:ref_end]
+    else:
+        return None
+
+def highlight_mismatches(read):
+    read_seq = read.query_sequence
+    aligned_pairs = read.get_aligned_pairs(with_seq=True)
+    alignment = []
+
+    for query_pos, ref_pos, ref_base in aligned_pairs:
+        if query_pos is not None:
+            read_base = read_seq[query_pos]
+
+            if ref_pos is not None and ref_base is not None:
+                # Compare read base and reference base
+                read_base_upper = read_base.upper()
+                ref_base_upper = ref_base.upper()
+
+                if read_base_upper != ref_base_upper:
+                    # Mismatch found
+                    if read.is_reverse:
+                        # Read is mapped to reverse strand
+                        if ref_base_upper == 'G' and read_base_upper == 'A':
+                            # G>A change on reverse strand (corresponds to C>T on forward strand)
+                            alignment.append(f'<span style="color: orange; font-weight: bold;">{read_base}</span>')
+                        else:
+                            # Other mismatches
+                            alignment.append(f'<span style="color: red; font-weight: bold;">{read_base}</span>')
+                    else:
+                        # Read is mapped to forward strand
+                        if ref_base_upper == 'C' and read_base_upper == 'T':
+                            # C>T change on forward strand
+                            alignment.append(f'<span style="color: orange; font-weight: bold;">{read_base}</span>')
+                        else:
+                            # Other mismatches
+                            alignment.append(f'<span style="color: red; font-weight: bold;">{read_base}</span>')
+                else:
+                    # Match
+                    alignment.append(f'<span style="color: lightblue;">{read_base}</span>')
+            else:
+                # Reference base not available (e.g., soft clipping)
+                alignment.append(f'<span style="color: gray;">{read_base}</span>')
+        else:
+            # Insertion or deletion relative to reference
+            alignment.append(f'<span style="color: purple; font-style: italic;">-</span>')
+
+    highlighted_seq = ''.join(alignment)
+    return dash_dangerously_set_inner_html.DangerouslySetInnerHTML(
+        f'<pre style="margin: 0; font-size: 14px;">{highlighted_seq}</pre>'
+    )
+
+reference_sequences = {}
+
+@app.callback(
+    Output('reference-store', 'data'),
+    [Input('file-store', 'data')]
+)
+def load_reference_sequences(file_store_data): # unused for now, not necessary
+    global reference_sequences
+    for f in file_store_data.get('files', []):
+        if f['format'] in ['fasta', 'fa', 'fna']:
+            temp_file_path, _ = process_uploaded_file(f['content'], f['filename'])
+            # Parse the reference genome and store sequences
+            for record in SeqIO.parse(temp_file_path, 'fasta'):
+                reference_sequences[record.id] = str(record.seq)
+    return {'status': 'Reference genome loaded'}
+
+    
+
+
+
+###################################
+
+
+##### Console #####################
+    
+@app.callback(
+    Output("console-offcanvas", "is_open"),
+    [Input("console-button", "n_clicks")],
+    [State("console-offcanvas", "is_open")],
+)
+def toggle_console(n_clicks, is_open):
+    if n_clicks:
+        return not is_open
+    return is_open
+
+@app.callback(
+    Output('console-log', 'children'),
+    [Input('console-interval', 'n_intervals')]
+)
+def update_console_log(n):
+    log_file_path = os.path.join(os.path.dirname(__file__), 'celery.log')
+    try:
+        with open(log_file_path, 'r') as f:
+            lines = f.readlines()
+            last_lines = lines[-200:]  # Adjust if needed
+            log_text = ''.join(last_lines)
+            
+            # Add classes for different log levels
+            log_text = log_text.replace('[ERROR]', '<span class="log-error">[ERROR]</span>')
+            log_text = log_text.replace('[WARNING]', '<span class="log-warning">[WARNING]</span>')
+            log_text = log_text.replace('[INFO]', '<span class="log-info">[INFO]</span>')
+            log_text = log_text.replace('[DEBUG]', '<span class="log-debug">[DEBUG]</span>')
+            
+            # Convert ANSI to HTML
+            conv = Ansi2HTMLConverter(inline=True)
+            html_content = conv.convert(log_text, full=False)
+            
+            # Wrap the HTML content in a div with appropriate styling
+            styled_html = f'''
+            <div style="color: #f8f9fa; background-color: {colors['background']};">
+                {html_content}
+            </div>
+            '''
+            return dash_dangerously_set_inner_html.DangerouslySetInnerHTML(styled_html)
+    except Exception as e:
+        return f'Error reading log file: {e}'
+
+#######################################################
+
+##### Converter ######################################
+
     
 
 @app.callback(
@@ -1760,7 +2621,87 @@ def update_filenames(filenames):
     else:
         return ''
 
+#######################################################
 
+
+######### Mapdamage Section ###########################
+
+
+@app.callback(
+    [Output('mapdamage-output', 'children'),
+     Output('mapdamage-interval', 'disabled')],
+    [Input('mapdamage-interval', 'n_intervals')],
+    [State('mapdamage-task-id', 'data'),
+     State('mapdamage-output-dir', 'data')]
+)
+def update_mapdamage_output(n_intervals, task_id, output_dir):
+    if not task_id:
+        raise dash.exceptions.PreventUpdate
+
+    task_result = run_mapdamage_task.AsyncResult(task_id)
+    state = task_result.state
+
+    if state == 'PENDING':
+        return html.Div("mapDamage2 analysis is pending...", className="text-info"), False
+    elif state == 'STARTED':
+        return html.Div("mapDamage2 analysis is running...", className="text-info"), False
+    elif state == 'SUCCESS':
+        # Disable the interval
+        # Process and display the results
+        return display_mapdamage_results(output_dir), True
+    elif state == 'FAILURE':
+        error = str(task_result.info)
+        return html.Div(f"Error running mapDamage2: {error}", className="text-danger"), True
+    else:
+        return html.Div(f"mapDamage2 analysis state: {state}", className="text-info"), False
+
+
+
+@app.callback(
+    [Output('mapdamage-status', 'children'),
+     Output('mapdamage-task-id', 'data')],
+    [Input('run-mapdamage-button', 'n_clicks')],
+    [State('mapdamage-bam-selector', 'value'),
+     State('mapdamage-ref-selector', 'value'),
+     State('file-store', 'data')]
+)
+def run_mapdamage(n_clicks, selected_bam, selected_ref, store_data):
+    if not n_clicks:
+        return dash.no_update, None
+
+    if selected_bam is None:
+        return html.Div("Please select a BAM file.", className="text-danger"), None
+
+    if selected_ref is None:
+        return html.Div("Please select a reference genome.", className="text-danger"), None
+
+    # Retrieve BAM file path
+    bam_file_data = next((f for f in store_data['files'] if f['filename'] == selected_bam), None)
+    if bam_file_data is None:
+        return html.Div("Selected BAM file not found.", className="text-danger"), None
+    bam_path = process_uploaded_file(bam_file_data['content'], bam_file_data['filename'])[0]
+
+    # Retrieve Reference genome path
+    ref_file_data = next((f for f in store_data['files'] if f['filename'] == selected_ref), None)
+    if ref_file_data is None:
+        return html.Div("Selected reference genome not found.", className="text-danger"), None
+    ref_path = process_uploaded_file(ref_file_data['content'], ref_file_data['filename'])[0]
+
+    # Output directory
+    output_dir = os.path.join(CUSTOM_TEMP_DIR, f"mapdamage_results_{uuid.uuid4()}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Start the mapDamage2 task
+    task = run_mapdamage_task.delay(bam_path, ref_path, output_dir)
+
+    return html.Div(f"mapDamage2 analysis started. Task ID: {task.id}", className="text-info"), task.id
+
+
+#######################################################
+
+
+
+######## Settings and stats menu ###############################
 
 
 # Callback to toggle settings offcanvas
@@ -1830,7 +2771,21 @@ def update_alignment_stats(selected_file, store_data):
         dcc.Graph(figure=mismatch_pie_chart)
     ])
 
-### CENTRIFUGE IMPLEMENTATION
+@app.callback(
+    Output('stats-offcanvas', 'is_open'),
+    [Input('stats-button', 'n_clicks')],
+    [State('stats-offcanvas', 'is_open')]
+)
+def toggle_offcanvas(n_clicks, is_open):
+    if n_clicks:
+        return not is_open
+    return is_open
+
+#############################################################
+
+
+
+####### CENTRIFUGE IMPLEMENTATION ###########################
 
 def parse_and_display_centrifuge_results(report_path):
     try:
@@ -1861,19 +2816,19 @@ def parse_and_display_centrifuge_results(report_path):
     return dcc.Graph(figure=fig)
 
 
-@celery_app.task
-def run_centrifuge_task(file_path, output_path, report_path, db_path):
-    centrifuge_cmd = [
-        "centrifuge",
-        "-x", db_path,
-        "-U", file_path,
-        "-S", output_path,
-        "--report-file", report_path
-    ]
-    try:
-        subprocess.run(centrifuge_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        raise e
+# @celery_app.task
+# def run_centrifuge_task(file_path, output_path, report_path, db_path):
+#     centrifuge_cmd = [
+#         "centrifuge",
+#         "-x", db_path,
+#         "-U", file_path,
+#         "-S", output_path,
+#         "--report-file", report_path
+#     ]
+#     try:
+#         subprocess.run(centrifuge_cmd, check=True)
+#     except subprocess.CalledProcessError as e:
+#         raise e
 
 
 @app.callback(
@@ -1917,7 +2872,7 @@ def run_centrifuge(n_clicks, selected_file, store_data, db_path):
 
 
 
-def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path): # visual error, n_intervals is being accessed
+def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path):
     if not task_id:
         raise dash.exceptions.PreventUpdate
 
@@ -1936,18 +2891,10 @@ def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path): # vi
     
 
 
-######
+#####################################################################
 
+############### Main Callbacks ######################################
 
-@app.callback(
-    Output('stats-offcanvas', 'is_open'),
-    [Input('stats-button', 'n_clicks')],
-    [State('stats-offcanvas', 'is_open')]
-)
-def toggle_offcanvas(n_clicks, is_open):
-    if n_clicks:
-        return not is_open
-    return is_open
 
 @app.callback(
     Output('ct-checklist', 'value'),
@@ -1955,24 +2902,40 @@ def toggle_offcanvas(n_clicks, is_open):
 )
 def update_ct_checklist(ct_value):
     if len(ct_value) > 1:
-        return ct_value[-1:]
+        # Keep only the last selected option
+        return [ct_value[-1]]
     return ct_value
 
+
 @app.callback(
-    [Output('file-store', 'data'),
-     Output('file-selector', 'options'),
-     Output('file-selector', 'value')],
-    [Input('upload-data', 'contents'),
-     Input('upload-data', 'filename')],
-    [State('file-store', 'data'),
-     State('file-selector', 'value')]
+    [
+        Output('file-store', 'data'),
+        Output('file-selector', 'options'),
+        Output('file-selector', 'value'),
+        Output('mapdamage-bam-selector', 'options'),
+        Output('mapdamage-ref-selector', 'options')
+    ],
+    [
+        Input('upload-data', 'contents'),
+        Input('upload-data', 'filename')
+    ],
+    [
+        State('file-store', 'data'),
+        State('file-selector', 'value')
+    ]
 )
-
 def update_file_store(contents, filenames, store_data, current_selection):
-    if contents is None:
-        return store_data, [], current_selection
+    if store_data is None:
+        store_data = {'files': []}
 
-    files = store_data['files']
+    if contents is None:
+        # Use existing options from store_data
+        options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files']]
+        bam_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] == 'bam']
+        ref_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] in ['fasta', 'fa', 'fna']]
+        return store_data, options, current_selection, bam_options, ref_options
+
+    files = store_data.get('files', [])
     new_file_added = False
     for content, filename in zip(contents, filenames):
         if filename not in [f['filename'] for f in files]:
@@ -1984,65 +2947,198 @@ def update_file_store(contents, filenames, store_data, current_selection):
 
     store_data['files'] = files
     options = [{'label': f['filename'], 'value': f['filename']} for f in files]
-    
+
+    # Populate BAM file options for mapDamage2
+    bam_options = [{'label': f['filename'], 'value': f['filename']} for f in files if f['format'] == 'bam']
+
+    # Populate FASTA file options for reference genome selector
+    ref_options = [{'label': f['filename'], 'value': f['filename']} for f in files if f['format'] in ['fasta', 'fa', 'fna']]
+
     # Automatically select the first file if no file is currently selected
     if current_selection is None and new_file_added:
         current_selection = files[0]['filename']
 
-    return store_data, options, current_selection
+    return store_data, options, current_selection, bam_options, ref_options
+
+
+
+# @app.callback(
+#     Output('reference-store', 'data'),
+#     [Input('upload-reference', 'contents')],
+#     [State('upload-reference', 'filename')]
+# )
+# def store_reference_genome(content, filename):
+#     if content is None:
+#         return dash.no_update
+#     file_format = filename.split('.')[-1].lower()
+#     if file_format not in ['fasta', 'fa', 'fna']:
+#         return dash.no_update  # Only accept FASTA files
+#     # Save the reference genome
+#     ref_path = save_uploaded_file(content, filename)
+#     return {'filename': filename, 'path': ref_path}
+
+
+# @app.callback(
+#     [
+#         Output('cg-content-histogram', 'figure'),
+#         Output('selected-lengths', 'data')
+#     ],
+#     [
+#         Input('read-length-histogram', 'selectedData'),
+#     ],
+#     [
+#         State('read-length-histogram', 'figure'),
+#         State('file-store', 'data'),
+#         State('file-selector', 'value'),
+#         State('nm-dropdown', 'value'),
+#         State('ct-checklist', 'value'),
+#         State('ct-count-dropdown', 'value'),
+#         State('mapq-range', 'value'),
+#     ]
+# )
+# def update_selection(
+#     read_length_selectedData, figure_state, store_data, selected_file,
+#     selected_nm, ct_checklist, ct_count_value, mapq_range
+# ):
+#     if selected_file is None or read_length_selectedData is None:
+#         raise dash.exceptions.PreventUpdate
+
+#     ct_checklist_tuple = tuple(ct_checklist)
+#     mapq_range_tuple = tuple(mapq_range)
+
+#     # Prepare C>T filters
+#     filter_ct = None
+#     exclusively_ct = False
+#     subtract_ct = False
+#     if 'only_ct' in ct_checklist_tuple:
+#         filter_ct = True
+#     elif 'exclude_ct' in ct_checklist_tuple:
+#         filter_ct = False
+#     elif 'exclusively_ct' in ct_checklist_tuple:
+#         exclusively_ct = True
+#     if 'subtract_ct' in ct_checklist_tuple:
+#         subtract_ct = True
+
+#     # Extract selected lengths
+#     selected_x_values = [point['x'] for point in read_length_selectedData['points']]
+#     selected_lengths = [int(x) for x in selected_x_values]
+
+#     # If no selection is made, consider all lengths
+#     if not selected_lengths:
+#         file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
+#         if file_data is None:
+#             raise dash.exceptions.PreventUpdate
+#         read_lengths, _, _ = load_and_process_file(
+#             file_data['content'], file_data['filename'], selected_nm,
+#             filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
+#         )
+#         selected_lengths = list(set(length for length, _, _, _, _, _ in read_lengths))
+
+#     # Retrieve read_lengths
+#     file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
+#     if file_data is None:
+#         raise dash.exceptions.PreventUpdate
+
+#     # Process the file to get read_lengths
+#     read_lengths, _, _ = load_and_process_file(
+#         file_data['content'], file_data['filename'], selected_nm,
+#         filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
+#     )
+
+#     # Filter read_lengths based on selected_lengths
+#     cg_contents_for_length = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
+
+#     # Create CG Content Histogram
+#     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
+
+#     # Store selected_lengths in the figure's custom data
+#     figure_state['custom_data'] = {'selected_lengths': selected_lengths}
+
+#     return cg_content_fig, figure_state
 
 
 @app.callback(
-    [Output('read-length-histogram', 'figure'),
-     Output('overall-cg-histogram', 'figure'),
-     Output('cg-content-histogram', 'figure'),
-     Output('damage-patterns', 'figure'),
-     Output('selected-lengths', 'data'),
-     Output('mismatch-frequency-plot', 'figure'),
-     Output('data-summary', 'children'),
-     Output('mapq-histogram', 'figure'),
-     Output('mismatch-type-bar-chart', 'figure'),
-     Output('damage-pattern-plot', 'figure')],
-    [Input('file-selector', 'value'),
-     Input('file-store', 'data'),
-     Input('mapq-range', 'value'),
-     Input('nm-dropdown', 'value'),
-     Input('ct-checklist', 'value'),
-     Input('ct-count-dropdown', 'value'),
-     Input('min-base-quality', 'value'),
-     Input('read-length-histogram', 'selectedData'),
-     Input('read-length-histogram', 'clickData'),
-     Input('clear-selection-button', 'n_clicks')],
-    [State('selected-lengths', 'data'),
-     State('read-length-histogram', 'figure')]
+    [
+        Output('read-length-histogram', 'figure'),
+        Output('overall-cg-histogram', 'figure'),
+        Output('cg-content-histogram', 'figure'),
+        Output('damage-patterns', 'figure'),
+        Output('selected-lengths', 'data'),
+        Output('mismatch-frequency-plot', 'figure'),
+        Output('data-summary', 'children'),
+        Output('mapq-histogram', 'figure'),
+        Output('mismatch-type-bar-chart', 'figure'),
+        Output('damage-pattern-plot', 'figure')
+    ],
+    [
+        Input('file-selector', 'value'),
+        Input('file-store', 'data'),
+        Input('mapq-range', 'value'),
+        Input('nm-dropdown', 'value'),
+        Input('ct-checklist', 'value'),
+        Input('ct-count-dropdown', 'value'),
+        Input('min-base-quality', 'value'),
+        Input('read-length-histogram', 'selectedData'),
+        Input('read-length-histogram', 'clickData'),
+        Input('clear-selection-button', 'n_clicks')
+    ],
+    [
+        State('selected-lengths', 'data'),
+        State('read-length-histogram', 'figure')
+    ]
 )
-def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_checklist, ct_count_value,
-                      min_base_quality,
-                      read_length_selectedData, read_length_clickData, clear_selection_nclicks,
-                      current_selected_lengths, current_fig):
 
+
+def update_histograms(
+    selected_file, store_data, mapq_range, selected_nm, ct_checklist, ct_count_value,
+    min_base_quality, read_length_selectedData, read_length_clickData, clear_selection_nclicks,
+    current_selected_lengths, current_fig
+):
     # Check if no file is selected
     if selected_file is None:
         empty_figure = go.Figure()
         empty_text = ""
-        return empty_figure, empty_figure, empty_figure, empty_figure, [], empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+        return (
+            empty_figure, empty_figure, empty_figure, empty_figure, [],
+            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+        )
 
-    # If clear-selection button is clicked, reset selection
+    # Initialize selected_lengths
+    selected_lengths = []
+
+    # Handle clear selection
     if clear_selection_nclicks:
-        current_selected_lengths = []
-        read_length_selectedData = None
-        read_length_clickData = None
+        selected_lengths = []
+    else:
+        # Handle selection from selectedData or clickData
+        selected_lengths = current_selected_lengths or []
+        
+        if read_length_selectedData and read_length_selectedData["points"]:
+            selected_x_values = [point['x'] for point in read_length_selectedData['points']]
+            # Update selected_lengths by intersecting current selection
+            if selected_lengths:
+                selected_lengths = list(set(selected_lengths).intersection(set(selected_x_values)))
+            else:
+                selected_lengths = selected_x_values
+        elif read_length_clickData and read_length_clickData["points"]:
+            # Handle clickData (single bar click)
+            clicked_length = int(read_length_clickData['points'][0]['x'])
+            if clicked_length not in selected_lengths:
+                selected_lengths.append(clicked_length)
 
     # Convert ct_checklist to tuple
     ct_checklist_tuple = tuple(ct_checklist)
 
     # Prepare C>T filters
     filter_ct = None
+    exclusively_ct = False
     subtract_ct = False
     if 'only_ct' in ct_checklist_tuple:
         filter_ct = True
     elif 'exclude_ct' in ct_checklist_tuple:
         filter_ct = False
+    elif 'exclusively_ct' in ct_checklist_tuple:
+        exclusively_ct = True
     if 'subtract_ct' in ct_checklist_tuple:
         subtract_ct = True
 
@@ -2053,11 +3149,15 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
     if file_data is None:
         empty_figure = go.Figure()
         empty_text = ""
-        return empty_figure, empty_figure, empty_figure, empty_figure, [], empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+        return (
+            empty_figure, empty_figure, empty_figure, empty_figure, [],
+            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+        )
 
-    # Load and process file content
+    # Adjust the call to load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
-        file_data['content'], file_data['filename'], selected_nm, filter_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
+        file_data['content'], file_data['filename'], selected_nm, filter_ct,
+        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
     )
 
     # Handle mismatch frequency based on file format
@@ -2075,13 +3175,11 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
             font=dict(color=colors['muted'])
         )
 
-    
     bin_centers, hist, bins = prepare_histogram_data(read_lengths)
 
-    
+    # Create read length histogram with uirevision
     read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
 
-    
     overall_cg_content = calculate_overall_cg_content(read_lengths)
     overall_cg_fig = go.Figure()
     overall_cg_fig.add_trace(go.Histogram(
@@ -2098,24 +3196,16 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
         font=dict(color=colors['muted'])
     )
 
-    # selection data for CG content hist
-    selected_lengths = current_selected_lengths
-    if read_length_selectedData:
-        selected_x_values = [point['x'] + 0.5 for point in read_length_selectedData['points']]
-        selected_lengths = [int(x) for x in selected_x_values]
-
-    if read_length_clickData:
-        clicked_length = int(read_length_clickData['points'][0]['x'] + 0.5)
-        selected_lengths = [clicked_length]
-
-    cg_contents_for_length = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
+    # Generate CG Content Histogram based on selected_lengths
+    cg_contents_for_length = [
+        cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths
+    ]
     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
 
     # Generate Damage Patterns Figure
     five_prime_end, three_prime_end = get_damage_patterns(deduped_file_path, file_format, filter_ct=filter_ct)
     damage_fig = create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 
-    
     mapq_scores = [mapq for _, _, _, _, _, mapq in read_lengths if mapq is not None]
     # Create MAPQ histogram
     mapq_fig = create_mapq_histogram(mapq_scores)
@@ -2137,16 +3227,14 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
             key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
             filtered_mismatch_counts[key] = filtered_mismatch_counts.get(key, 0) + 1
 
-        # plotting
+        # Plotting
         mismatch_type_fig = create_mismatch_type_bar_chart(filtered_mismatch_counts)
-
-        
         damage_pattern_fig = create_damage_pattern_plot(filtered_mismatches)
     else:
         mismatch_type_fig = go.Figure()
         damage_pattern_fig = go.Figure()
 
-    # data summary after generating all plots
+    # Data summary after generating all plots
     read_length_text = get_read_length_data(read_lengths)
     cg_content_text = get_overall_cg_content_data(read_lengths)
     damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
@@ -2166,7 +3254,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
     else:
         cg_distribution_text = "No CG content data for selected reads.\n"
 
-    # combined data
+    # Combined data summary text
     data_summary_text = (
         filter_options_text + "\n" +
         read_length_text + "\n" +
@@ -2178,7 +3266,7 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
         stats_text
     )
 
-    # main return
+    # Return updated figures and data
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
         selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
@@ -2187,32 +3275,55 @@ def update_histograms(selected_file, store_data, mapq_range, selected_nm, ct_che
 
 
 
+
+
+
+
     
 
 
 @app.callback(
     Output("download-file", "data"),
-    [Input("export-button", "n_clicks"),
-     State('read-length-histogram', 'selectedData'),
-     State('cg-content-histogram', 'clickData'),
-     State('file-selector', 'value'),
-     State('file-store', 'data'),
-     State('nm-dropdown', 'value'),
-     State('ct-checklist', 'value'),
-     State('ct-count-dropdown', 'value')],
+    [Input("export-button", "n_clicks")],
+    [
+        State('file-selector', 'value'),
+        State('file-store', 'data'),
+        State('nm-dropdown', 'value'),
+        State('ct-checklist', 'value'),
+        State('ct-count-dropdown', 'value'),
+        State('mapq-range', 'value'),
+        State('selected-lengths', 'data'),
+    ],
     prevent_initial_call=True
 )
-def export_reads(n_clicks, read_length_selectedData, cg_clickData, selected_file, store_data, selected_nm, ct_checklist, ct_count_value):
+def export_reads(
+    n_clicks, selected_file, store_data, selected_nm, ct_checklist, ct_count_value, mapq_range, selected_lengths
+):
+    if n_clicks is None or n_clicks == 0:
+        raise dash.exceptions.PreventUpdate
+
     if selected_file is None:
         return None
 
+    if not selected_lengths:
+        # No reads are selected; prevent export
+        print("No read lengths selected. Export aborted.")
+        return None
+
+    ct_checklist_tuple = tuple(ct_checklist)
+    mapq_range_tuple = tuple(mapq_range)
+
+    # Prepare C>T filters
     filter_ct = None
+    exclusively_ct = False
     subtract_ct = False
-    if 'only_ct' in ct_checklist:
+    if 'only_ct' in ct_checklist_tuple:
         filter_ct = True
-    elif 'exclude_ct' in ct_checklist:
+    elif 'exclude_ct' in ct_checklist_tuple:
         filter_ct = False
-    elif 'subtract_ct' in ct_checklist:
+    elif 'exclusively_ct' in ct_checklist_tuple:
+        exclusively_ct = True
+    if 'subtract_ct' in ct_checklist_tuple:
         subtract_ct = True
 
     exact_ct_changes = None if ct_count_value == 'any' else int(ct_count_value)
@@ -2221,28 +3332,94 @@ def export_reads(n_clicks, read_length_selectedData, cg_clickData, selected_file
     if file_data is None:
         return None
 
-    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
+    # Re-process the file with all filters applied
+    read_lengths, file_format, deduped_file_path = load_and_process_file(
+        file_data['content'], file_data['filename'], selected_nm, filter_ct,
+        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
+    )
 
-    deduped_file_path = os.path.join(CUSTOM_TEMP_DIR, f"deduped_{uuid.uuid4()}_{selected_file}")
-    read_lengths = remove_duplicates_with_strand_check(temp_file_path, deduped_file_path, file_format)
-
+    # Apply any additional adjustments if necessary
     if subtract_ct:
-        read_lengths = adjust_nm_for_ct_changes(read_lengths, subtract_ct)
+        read_lengths = adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value)
 
-    selected_lengths = []
-    selected_cg_content = []
-
-    if read_length_selectedData is not None:
-        selected_x_values = [point['x'] + 0.5 for point in read_length_selectedData['points']]
-        selected_lengths = [int(x) for x in selected_x_values]
-
-    if cg_clickData is not None:
-        selected_cg_content.append(cg_clickData['points'][0]['x'])
+    selected_cg_content = []  # Update if CG content selection is implemented
 
     output_file_path = os.path.join(CUSTOM_TEMP_DIR, f"selected_{uuid.uuid4()}_{selected_file}")
-    export_selected_reads(read_lengths, selected_lengths, selected_cg_content, output_file_path, deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes)
+
+    # Export the selected reads with filters applied
+    export_selected_reads(
+        read_lengths, selected_lengths, selected_cg_content, output_file_path,
+        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes
+    )
 
     return dcc.send_file(output_file_path)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+##########################################################################################################
+
+##     ##    ###    #### ##    ##    ######## ##     ## ##    ##  ######  ######## ####  #######  ##    ## 
+###   ###   ## ##    ##  ###   ##    ##       ##     ## ###   ## ##    ##    ##     ##  ##     ## ###   ## 
+#### ####  ##   ##   ##  ####  ##    ##       ##     ## ####  ## ##          ##     ##  ##     ## ####  ## 
+## ### ## ##     ##  ##  ## ## ##    ######   ##     ## ## ## ## ##          ##     ##  ##     ## ## ## ## 
+##     ## #########  ##  ##  ####    ##       ##     ## ##  #### ##          ##     ##  ##     ## ##  #### 
+##     ## ##     ##  ##  ##   ###    ##       ##     ## ##   ### ##    ##    ##     ##  ##     ## ##   ### 
+##     ## ##     ## #### ##    ##    ##        #######  ##    ##  ######     ##    ####  #######  ##    ##
+
+##########################################################################################################
+
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    # Define the path for your log file
+    log_file_path = os.path.join(os.path.dirname(__file__), 'celery.log')
+
+    def log_to_file(process, log_file_path):
+        with open(log_file_path, 'w') as log_file:
+            while True:
+                output = process.stdout.readline()
+                if process.poll() is not None and output == b'':
+                    break
+                if output:
+                    log_file.write(output)
+                    log_file.flush()
+
+    # Launch the Celery worker
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        worker_process = subprocess.Popen(
+            [
+                sys.executable, '-m', 'celery', '-A', 'tasks.celery_app', 'worker',
+                '--loglevel=info'
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        # Start a thread to log output to a file
+        log_thread = threading.Thread(target=log_to_file, args=(worker_process, log_file_path))
+        log_thread.daemon = True
+        log_thread.start()
+
+        print(f"Started Celery worker with PID: {worker_process.pid}")
+
+    else:
+        worker_process = None
+
+    try:
+        app.run_server(debug=True)
+    finally:
+        if worker_process:
+            print("Terminating Celery worker...")
+            worker_process.terminate()
+            worker_process.wait()
