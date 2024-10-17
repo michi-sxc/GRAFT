@@ -14,6 +14,7 @@
   - [Data Filtering](#data-filtering)
   - [Data Visualization](#data-visualization)
   - [File Conversion](#file-conversion)
+  - [File Viewer](#file-viewer)
   - [Centrifuge Analysis](#centrifuge-analysis)
 - [Configuration](#configuration)
 - [Folder Structure](#folder-structure)
