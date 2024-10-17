@@ -27,6 +27,7 @@ import zipfile
 from ansi2html import Ansi2HTMLConverter
 from itertools import islice
 import re
+from DUST import dust_module
 
 
 from tasks import celery_app, run_mapdamage_task, run_centrifuge_task
@@ -238,7 +239,7 @@ def export_selected_reads(
                 deamination_pattern = get_deamination_pattern(read)
                 ct_changes = count_ct_changes(read)
 
-                # Apply filters based on C>T changes
+                # set filters based on C>T changes
                 if filter_ct is not None:
                     has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
                     if filter_ct and not has_ct:
@@ -246,19 +247,19 @@ def export_selected_reads(
                     elif not filter_ct and has_ct:
                         continue
 
-                # Apply NM filter
+                # set NM filter
                 if selected_nm is not None and selected_nm != 'all' and nm != selected_nm:
                     continue
 
-                # Apply exact C>T changes filter
+                # set exact C>T changes filter
                 if exact_ct_changes is not None and ct_changes != exact_ct_changes:
                     continue
 
-                # Apply selected lengths filter
+                # set selected lengths filter
                 if selected_lengths and length not in selected_lengths:
                     continue  # Skip this read
 
-                # Apply selected CG content filter (if applicable)
+                # set selected CG content filter (if applicable)
                 if selected_cg_content and cg not in selected_cg_content:
                     continue  # Skip this read
 
@@ -266,11 +267,11 @@ def export_selected_reads(
     else:
         with open(output_file_path, "w") as outputfile:
             for length, cg, _, seq, record in read_lengths:
-                # Apply selected lengths filter
+                # set selected lengths filter
                 if selected_lengths and length not in selected_lengths:
                     continue  # Skip this record
 
-                # Apply selected CG content filter (if applicable)
+                # set selected CG content filter (if applicable)
                 if selected_cg_content and cg not in selected_cg_content:
                     continue  # Skip this record
 
@@ -290,7 +291,7 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
     )
 
     if file_format in ['bam', 'sam']:
-        # Apply MAPQ filter only for BAM/SAM files
+        # set MAPQ filter only for BAM/SAM files
         min_mapq, max_mapq = mapq_range
         read_lengths = [
             r for r in read_lengths
@@ -320,27 +321,28 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
     return read_lengths, file_format, deduped_file_path
 
 
-
-def remove_duplicates_with_strand_check(input_file, output_file, file_format):
+def remove_duplicates_with_strand_check(input_file, output_file, file_format, apply_dust=False):
     if file_format in ['bam', 'sam']:
         bamfile = pysam.AlignmentFile(input_file, "rb" if file_format == 'bam' else "r", check_sq=False)
         outputfile = pysam.AlignmentFile(output_file, "wb" if file_format == 'bam' else 'w', header=bamfile.header)
     else:
         outputfile = open(output_file, "w")
-
+    
     unique_reads = set()
     read_lengths = []
-
+    
     if file_format in ['bam', 'sam']:
         for read in bamfile:
-            # Remove the check for read.is_unmapped
             sequence = read.query_sequence
+            if apply_dust:
+                masked_seq = dust_module.dust_mask(sequence)
+                if set(masked_seq) == {'N'}:  # DUST masks low complexity to 'N'
+                    continue
+           
             reverse_complement = str(Seq(sequence).reverse_complement())
-
             previous_length = len(unique_reads)
             unique_reads.add(sequence)
             unique_reads.add(reverse_complement)
-
             if len(unique_reads) > previous_length:
                 outputfile.write(read)
                 mapq = read.mapping_quality
@@ -349,26 +351,28 @@ def remove_duplicates_with_strand_check(input_file, output_file, file_format):
             else:
                 continue
     else:
-        # Unchanged for FASTA/FASTQ
         for record in SeqIO.parse(input_file, file_format):
             sequence = str(record.seq)
+            if apply_dust:
+                masked_seq = dust_module.dust_mask(sequence)
+                if set(masked_seq) == {'N'}:  # DUST masks low complexity to 'N'
+                    continue
+           
             reverse_complement = str(Seq(sequence).reverse_complement())
-
             previous_length = len(unique_reads)
             unique_reads.add(sequence)
             unique_reads.add(reverse_complement)
-
             if len(unique_reads) > previous_length:
                 SeqIO.write(record, outputfile, file_format)
                 read_lengths.append((len(sequence), calculate_cg_content(sequence), None, sequence, record, None))
             else:
                 continue
-
+    
     if file_format in ['bam', 'sam']:
         bamfile.close()
     outputfile.close()
-
     return read_lengths
+
 
 
 
@@ -501,7 +505,7 @@ def has_only_ct_mismatches(read):
                 mismatches.append({'ref_base': ref_base, 'read_base': read_base})
 
     if not mismatches:
-        return False  # No mismatches
+        return False  
 
     for mismatch in mismatches:
         ref_base = mismatch['ref_base']
@@ -1431,7 +1435,7 @@ settings_offcanvas = dbc.Offcanvas(
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # Apply and Reset Buttons
+        # set and Reset Buttons
         html.Div(
             [
                 dbc.Button("Apply Settings", id="apply-settings-button", color="success", className="me-2"),
@@ -2168,7 +2172,7 @@ def display_file_content(
     )
 
 
-    # Apply additional filters based on base quality
+    # set additional filters based on base quality
     if file_format in ['bam', 'sam']:
         filtered_reads = []
         for length, cg, nm, seq, read, mapq in read_lengths:
@@ -3214,7 +3218,7 @@ def update_histograms(
     temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
     stats = calculate_alignment_stats(temp_file_path, file_format)
 
-    # Apply filters to mismatches
+    # set filters to mismatches
     if stats.get('Mismatch Details') != 'N/A':
         filtered_mismatches = filter_mismatches(
             stats['Mismatch Details'],
@@ -3338,7 +3342,7 @@ def export_reads(
         exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
     )
 
-    # Apply any additional adjustments if necessary
+    # set any additional adjustments if necessary
     if subtract_ct:
         read_lengths = adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value)
 
