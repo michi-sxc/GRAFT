@@ -42,6 +42,7 @@ GRAFT is an interactive toolkit written in Python for genomic data analysis espe
 - Dependencies (see `requirements.txt`):
   - dash
   - dash-bootstrap-components
+  - dash_dangerously_set_inner_html
   - dash-iconify
   - pysam
   - biopython
@@ -51,6 +52,7 @@ GRAFT is an interactive toolkit written in Python for genomic data analysis espe
   - celery
   - redis
   - yaml
+  - ansi2html
 - **Redis**: Required for Celery task queue.
 - **Centrifuge**: For taxonomic classification features only. Dashboard works perfectly fine without Centrifuge being installed.
 
