@@ -26,13 +26,14 @@
 
 
 
-GRAFT is an interactive dashboard written in Python for genomic data analysis especially for working with aDNA data, focusing on BAM, SAM, FASTA, and FASTQ files. Built with Dash and Plotly, GRAFT provides functionalities for data upload, visualization, filtering, and batch conversion of genomic read files. It supports exploring read length distributions, CG content, damage patterns, and mismatch frequencies.
+GRAFT is an interactive toolkit written in Python for genomic data analysis especially for working with aDNA data, focusing on BAM, SAM, FASTA, and FASTQ files. Built with Dash and Plotly, GRAFT provides functionalities for data upload, visualization, filtering, and batch conversion of genomic read files. It supports exploring read length distributions, CG content, damage patterns, and mismatch frequencies. It supports taxonomic classification with Centrifuge. PMD modeling is implemented via mapDamage2. 
 ## Features
 
 - **Interactive Data Visualization**: Visualize read length distributions, CG content, damage patterns, and mismatch frequencies.
 - **Advanced Filtering**: Apply filters on Mapping Quality (MAPQ), read mismatch counts, and C>T changes.
 - **File Upload and Conversion**: Support for BAM, SAM, FASTA, and FASTQ files. Batch conversion between these formats.
 - **Centrifuge Integration**: Perform taxonomic classification on FASTQ files.
+- **mapDamage Integration**: PMD assessment with reference genomes.
 
 ## Requirements
 
@@ -80,13 +81,7 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
      brew install redis
      ```
 
-4. **Start Redis**:
-
-   ```bash
-   redis-server
-   ```
-
-5. **Install Centrifuge (required for taxonomic classification)**:
+4. **Install Centrifuge (required for taxonomic classification)**:
 
    - **Install Bioconda** (if not already installed):
      ```bash
@@ -100,14 +95,7 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
      ```
    - Alternatively, you can install Centrifuge from source following the instructions on the [Centrifuge GitHub repository](https://github.com/DaehwanKimLab/centrifuge).
 
-6. **Configure Celery**:
-
-   - Start a Celery worker:
-     ```bash
-     celery -A app.celery_app worker --loglevel=info
-     ```
-
-7. **Running the Application**:
+5. **Running the Application**:
 
    - To start the dashboard, run:
      ```bash
@@ -147,13 +135,7 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
      sudo apt-get install redis-server
      ```
 
-5. **Start Redis**:
-
-   ```bash
-   redis-server
-   ```
-
-6. **Install Centrifuge (required for taxonomic classification)**:
+5. **Install Centrifuge (required for taxonomic classification)**:
 
    - **Install Bioconda**:
      ```bash
@@ -166,14 +148,7 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
      conda install -c bioconda centrifuge
      ```
 
-7. **Configure Celery**:
-
-   - Start a Celery worker:
-     ```bash
-     celery -A app.celery_app worker --loglevel=info
-     ```
-
-8. **Running the Application**:
+6. **Running the Application**:
 
    - Set the Centrifuge library folder in the `config.yaml`
 
@@ -182,6 +157,8 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
      python app.py
      ```
      The dashboard will be accessible at [http://127.0.0.1:8050/](http://127.0.0.1:8050/).
+
+**Further setup information**: Redis-server and Celery workers are automatically setup by the tool.
 
 ### Opening WSL in VSCode (optional):
 
@@ -239,6 +216,13 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
 - Converted files can be downloaded directly or as a ZIP archive if multiple files are converted.
 - Please note that fasta/q to BAM/SAM conversions will generate dummy headers and empty metadata as fasta/q files do not contain BAM/SAM specific data.
 
+### File Viewer
+
+- Upload file on main analysis page.
+- Navigate to the "File Viewer" tab and select uploaded file to view genomic sequence data.
+- Full data filtering capabilities as on the main page.
+- Mismatched bases are visualized in color: orange for C>T transitions, red for all other mismatches.
+
 ### Centrifuge Analysis
 
 - Select a FASTQ file from the "File Selection" dropdown.
@@ -259,10 +243,12 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
 ## Folder Structure
 
 - `app.py`: Main application script.
+- `tasks.py`: Celery worker setup for Centrifuge and mapDamage integration.
 - `config.yaml`: Configuration file for application settings.
 - `requirements.txt`: Python dependencies.
 - `assets/`: Folder for custom CSS and assets used in the dashboard.
 - `templates/`: HTML templates for the Dash application.
+- `mapDamage/`: mapDamage2 integration. 
 - `README.md`: Project documentation.
 
 ## Known Issues
@@ -270,9 +256,6 @@ GRAFT is an interactive dashboard written in Python for genomic data analysis es
 - **Performance**: Processing large BAM files can be slow and may consume significant memory. Consider downsampling or using a machine with higher specifications.
 - **File Compatibility**: Ensure uploaded files conform to the appropriate format specifications. Corrupted or improperly formatted files may cause errors.
 - **Centrifuge Database**: The database for Centrifuge can be large. Ensure you have sufficient disk space and that the path is correctly set in the settings.
-- **Data Selecting**: Selecting data from the read length histogram might not always work. This is a limitation of the plotly library.
-- **Exporting data**: The export file function is still under development and not fully implemented.
-- **Centrifuge implementation**: Proper centrifuge taxonomic classification is not working yet. This is a placeholder module with basic functionality.
 
 ## Contributing
 
