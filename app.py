@@ -1,12 +1,3 @@
-
-
-#  ██████  ██████   █████  ███████ ████████ 
-# ██       ██   ██ ██   ██ ██         ██    
-# ██   ███ ██████  ███████ █████      ██    
-# ██    ██ ██   ██ ██   ██ ██         ██    
-#  ██████  ██   ██ ██   ██ ██         ██    
-                                          
-                                          
 import pysam
 import sys
 import threading
@@ -233,28 +224,6 @@ def process_uploaded_file(content, filename):
         fp.write(decoded)
 
     return temp_file_path, file_format
-
-def create_temp_bam(filtered_reads, original_file_path, file_format):
-    # Open the original file
-    original_file = pysam.AlignmentFile(original_file_path, "rb" if file_format == 'bam' else "r")
-
-    # Create a temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.bam' if file_format == 'bam' else '.sam')
-    temp_file_path = temp_file.name
-    temp_file.close()
-
-    # Open a new BAM/SAM file to write filtered reads
-    with pysam.AlignmentFile(temp_file_path, "wb" if file_format == 'bam' else "w", template=original_file) as temp_bam:
-        # Create a set of read identifiers from filtered_reads
-        filtered_read_ids = set(read[2] for read in filtered_reads)  # Assuming read[2] is read_id
-
-        # Iterate over the original file and write only filtered reads
-        for read in original_file:
-            if read.query_name in filtered_read_ids:
-                temp_bam.write(read)
-
-    original_file.close()
-    return temp_file_path
 
 def export_selected_reads(
     read_lengths, selected_lengths, selected_cg_content, output_file_path,
@@ -691,6 +660,7 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
 
 def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
     cg_content_fig = go.Figure()
+
     if cg_contents_for_length:
         cg_content_fig.add_trace(go.Histogram(
             x=cg_contents_for_length,
@@ -700,19 +670,15 @@ def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
         selected_lengths_str = ', '.join(map(str, selected_lengths)) if selected_lengths else 'All'
         cg_content_fig.update_layout(
             title=f'CG Content Distribution for Selected Read Length(s): {selected_lengths_str}',
-            uirevision= 'cg-content',
             xaxis=dict(title='CG Content', color=colors['muted']),
             yaxis=dict(title='Frequency', color=colors['muted']),
             paper_bgcolor=colors['plot_bg'],
             plot_bgcolor=colors['plot_bg'],
             font=dict(color=colors['muted']),
-            dragmode='select',  # Enable selection mode
-            selectdirection='h',  # Horizontal selection
-            newselection_line=dict(
-                color=colors['secondary'],
-                width=2,
-                dash='dashdot'
-            )
+            dragmode='select',
+            newselection_line_width=2,
+            newselection_line_color=colors['secondary'],
+            newselection_line_dash='dashdot'
         )
     else:
         cg_content_fig.update_layout(
@@ -721,6 +687,7 @@ def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
             plot_bgcolor=colors['plot_bg'],
             font=dict(color=colors['muted'])
         )
+
     return cg_content_fig
 
 def create_mismatch_type_bar_chart(mismatch_counts):
@@ -887,20 +854,10 @@ def calculate_mismatch_frequency(read_lengths, file_format):
 
     # Normalize counts to calculate frequency
     frequencies = {key: [c / total_reads for c in counts[key]] for key in counts}
-        # 1. For each key (mismatch type) in the counts dictionary...
-        # 2. It's dividing each count by total_reads...
-        # 3. Creating a list of these divided values for each position.
-
-    # Sum across all mismatch types can exceed one, even though y-axis shows normalized values, not raw counts (which might lead to misinterpretations):
-    # A) single read can have multiple types of mismatches
-    # B) independent mismatch frequencies for each mismatch type
-    #       --> per-read frequency
-   
-
     return frequencies
 
 
-def create_mismatch_frequency_plot(frequencies): # add double-stranded option
+def create_mismatch_frequency_plot(frequencies):
     if not frequencies:
         fig = go.Figure()
         fig.update_layout(
@@ -943,9 +900,8 @@ def create_mismatch_frequency_plot(frequencies): # add double-stranded option
         marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
     ))
 
-
     
-    fig.update_layout( 
+    fig.update_layout(
         title=dict(
             text='Mismatch Frequency (per read) vs Distance from Read End',
             font=dict(size=20, color=colors['muted']),
@@ -1740,7 +1696,6 @@ app.layout = html.Div([
     # Stores and Download components
     dcc.Store(id='file-store', data={'files': []}),
     dcc.Store(id='selected-lengths', data=[]),
-    dcc.Store(id='selected-cg-range', data={'min': None, 'max': None}),
     dcc.Store(id='read-length-selection-store'),
     dcc.Store(id='selected-cg-contents', data=[]),
     dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
@@ -3113,7 +3068,6 @@ def update_file_store(contents, filenames, store_data, current_selection):
         Output('cg-content-histogram', 'figure'),
         Output('damage-patterns', 'figure'),
         Output('selected-lengths', 'data'),
-        Output('selected-cg-range', 'data'),
         Output('mismatch-frequency-plot', 'figure'),
         Output('data-summary', 'children'),
         Output('mapq-histogram', 'figure'),
@@ -3130,84 +3084,51 @@ def update_file_store(contents, filenames, store_data, current_selection):
         Input('min-base-quality', 'value'),
         Input('read-length-histogram', 'selectedData'),
         Input('read-length-histogram', 'clickData'),
-        Input('overall-cg-histogram', 'selectedData'),  
-        Input('overall-cg-histogram', 'clickData'),     
         Input('clear-selection-button', 'n_clicks')
     ],
     [
         State('selected-lengths', 'data'),
-        State('selected-cg-range', 'data'),
         State('read-length-histogram', 'figure')
     ]
 )
+
+
 def update_histograms(
-    selected_file, 
-    store_data, 
-    mapq_range, 
-    selected_nm, 
-    ct_checklist, 
-    ct_count_value,
-    min_base_quality, 
-    read_length_selectedData, 
-    read_length_clickData, 
-    overall_cg_selectedData,    
-    overall_cg_clickData,       
-    clear_selection_nclicks, 
-    current_selected_lengths, 
-    current_selected_cg, 
-    current_fig
+    selected_file, store_data, mapq_range, selected_nm, ct_checklist, ct_count_value,
+    min_base_quality, read_length_selectedData, read_length_clickData, clear_selection_nclicks,
+    current_selected_lengths, current_fig
 ):
-    # Initialize selections
+    # Check if no file is selected
+    if selected_file is None:
+        empty_figure = go.Figure()
+        empty_text = ""
+        return (
+            empty_figure, empty_figure, empty_figure, empty_figure, [],
+            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+        )
+
+    # Initialize selected_lengths
     selected_lengths = []
-    selected_cg_range = {'min': None, 'max': None}
 
     # Handle clear selection
     if clear_selection_nclicks:
         selected_lengths = []
-        selected_cg_range = {'min': None, 'max': None}
     else:
-        # Handle length selection
+        # Handle selection from selectedData or clickData
         selected_lengths = current_selected_lengths or []
         
         if read_length_selectedData and read_length_selectedData["points"]:
             selected_x_values = [point['x'] for point in read_length_selectedData['points']]
+            # Update selected_lengths by intersecting current selection
             if selected_lengths:
                 selected_lengths = list(set(selected_lengths).intersection(set(selected_x_values)))
             else:
                 selected_lengths = selected_x_values
         elif read_length_clickData and read_length_clickData["points"]:
+            # Handle clickData (single bar click)
             clicked_length = int(read_length_clickData['points'][0]['x'])
             if clicked_length not in selected_lengths:
                 selected_lengths.append(clicked_length)
-
-        # Handle overall CG content selection
-        if overall_cg_selectedData and overall_cg_selectedData["points"]:
-            cg_x_values = [point['x'] for point in overall_cg_selectedData['points']]
-            selected_cg_range = {
-                'min': min(cg_x_values),
-                'max': max(cg_x_values)
-            }
-        elif overall_cg_clickData and overall_cg_clickData["points"]:
-            clicked_cg = overall_cg_clickData['points'][0]['x']
-            # For single clicks, create a small range around the clicked value
-            selected_cg_range = {
-                'min': clicked_cg - 0.01,  # +/- 1% range around clicked value
-                'max': clicked_cg + 0.01
-            }
-
-    # Update filter_reads function to handle both length and CG content filtering
-    def filter_reads(read_lengths, selected_lengths, selected_cg_range):
-        filtered_reads = []
-        for read in read_lengths:
-            length, cg, *rest = read
-            length_match = not selected_lengths or length in selected_lengths
-            cg_match = True
-            if selected_cg_range['min'] is not None:
-                cg_match = selected_cg_range['min'] <= cg <= selected_cg_range['max']
-            
-            if length_match and cg_match:
-                filtered_reads.append(read)
-        return filtered_reads
 
     # Convert ct_checklist to tuple
     ct_checklist_tuple = tuple(ct_checklist)
@@ -3233,7 +3154,7 @@ def update_histograms(
         empty_figure = go.Figure()
         empty_text = ""
         return (
-            empty_figure, empty_figure, empty_figure, empty_figure, [], {'min': None, 'max': None},
+            empty_figure, empty_figure, empty_figure, empty_figure, [],
             empty_figure, empty_text, empty_figure, empty_figure, empty_figure
         )
 
@@ -3243,15 +3164,9 @@ def update_histograms(
         exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
     )
 
-    # Apply filtering to get filtered read lengths
-    filtered_reads = filter_reads(read_lengths, selected_lengths, selected_cg_range)
-
-    # Calculate overall CG content based on filtered reads
-    overall_cg_content = calculate_overall_cg_content(filtered_reads)
-
     # Handle mismatch frequency based on file format
     if file_format in ['bam', 'sam']:
-        frequencies = calculate_mismatch_frequency(filtered_reads, file_format)
+        frequencies = calculate_mismatch_frequency(read_lengths, file_format)
         mismatch_freq_fig = create_mismatch_frequency_plot(frequencies)
     else:
         frequencies = None
@@ -3264,86 +3179,46 @@ def update_histograms(
             font=dict(color=colors['muted'])
         )
 
-    # Update histogram data based on filtered reads
-    bin_centers, hist, bins = prepare_histogram_data(filtered_reads)
+    bin_centers, hist, bins = prepare_histogram_data(read_lengths)
 
     # Create read length histogram with uirevision
-    read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, filtered_reads, bins)
+    read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
 
-    # Create overall CG content histogram with uirevision
+    overall_cg_content = calculate_overall_cg_content(read_lengths)
     overall_cg_fig = go.Figure()
-
-    # Add the main histogram trace
     overall_cg_fig.add_trace(go.Histogram(
         x=overall_cg_content,
         nbinsx=20,
-        marker_color=colors['marker'],
-        name='Filtered',
-        selected=dict(
-            marker=dict(color=colors['highlight'])
-        ),
-        unselected=dict(
-            marker=dict(opacity=0.3)
-        )
+        marker_color=colors['marker']
     ))
-
-    # Add a trace for the unfiltered data in a lighter color for comparison
-    if selected_lengths or selected_cg_range['min'] is not None:
-        unfiltered_cg_content = calculate_overall_cg_content(read_lengths)
-        overall_cg_fig.add_trace(go.Histogram(
-            x=unfiltered_cg_content,
-            nbinsx=20,
-            marker_color=colors['muted'],
-            opacity=0.3,
-            name='Unfiltered'
-        ))
-
-    # Add uirevision to preserve state
     overall_cg_fig.update_layout(
         title='Overall CG Content Distribution',
-        xaxis=dict(
-            title='CG Content',
-            color=colors['muted'],
-            range=[0, 1]
-        ),
-        yaxis=dict(
-            title='Frequency',
-            color=colors['muted']
-        ),
+        xaxis=dict(title='CG Content', color=colors['muted']),
+        yaxis=dict(title='Frequency', color=colors['muted']),
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted']),
-        showlegend=bool(selected_lengths or selected_cg_range['min'] is not None),
-        dragmode='select',
-        selectdirection='h',  # Horizontal selection only
-        uirevision='overall_cg_histogram'  # Add uirevision
+        font=dict(color=colors['muted'])
     )
 
     # Generate CG Content Histogram based on selected_lengths
     cg_contents_for_length = [
-        cg for length, cg, *rest in filtered_reads if length in selected_lengths
+        cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths
     ]
     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
 
-    # Create a temporary file with filtered reads
-    temp_filtered_file_path = create_temp_bam(filtered_reads, deduped_file_path, file_format)
-
-    # Use the original functions with the temporary file
-    five_prime_end, three_prime_end = get_damage_patterns(temp_filtered_file_path, file_format, filter_ct=filter_ct)
+    # Generate Damage Patterns Figure
+    five_prime_end, three_prime_end = get_damage_patterns(deduped_file_path, file_format, filter_ct=filter_ct)
     damage_fig = create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 
-    # Calculate alignment stats using the temporary file
-    stats = calculate_alignment_stats(temp_filtered_file_path, file_format)
-
-    # Remove the temporary file after use
-    os.remove(temp_filtered_file_path)
-
-    # Create MAPQ histogram using filtered reads
-    mapq_scores = [mapq for _, _, *rest, mapq in filtered_reads if mapq is not None]
+    mapq_scores = [mapq for _, _, _, _, _, mapq in read_lengths if mapq is not None]
+    # Create MAPQ histogram
     mapq_fig = create_mapq_histogram(mapq_scores)
 
+    # Calculate alignment stats
+    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
+    stats = calculate_alignment_stats(temp_file_path, file_format)
 
-    # Set filters to mismatches using filtered reads
+    # set filters to mismatches
     if stats.get('Mismatch Details') != 'N/A':
         filtered_mismatches = filter_mismatches(
             stats['Mismatch Details'],
@@ -3364,14 +3239,14 @@ def update_histograms(
         damage_pattern_fig = go.Figure()
 
     # Data summary after generating all plots
-    read_length_text = get_read_length_data(filtered_reads)
-    cg_content_text = get_overall_cg_content_data(filtered_reads)
+    read_length_text = get_read_length_data(read_lengths)
+    cg_content_text = get_overall_cg_content_data(read_lengths)
     damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
     mismatch_frequency_text = get_mismatch_frequency_data(frequencies)
     stats_text = get_alignment_stats_text(stats)
-    read_length_cg_average_text = get_read_length_CG_average(filtered_reads)
+    read_length_cg_average_text = get_read_length_CG_average(read_lengths)
     filter_options_text = get_filter_options_text(selected_nm, ct_checklist, ct_count_value, mapq_range_tuple)
-    selected_cg_contents = [cg for length, cg, *rest in filtered_reads if length in selected_lengths]
+    selected_cg_contents = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
     if selected_cg_contents:
         cg_series = pd.Series(selected_cg_contents)
         cg_distribution_text = (
@@ -3398,9 +3273,11 @@ def update_histograms(
     # Return updated figures and data
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
-        selected_lengths, selected_cg_range, mismatch_freq_fig, data_summary_text,
-        mapq_fig, mismatch_type_fig, damage_pattern_fig
+        selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
+        mismatch_type_fig, damage_pattern_fig
     )
+
+
 
 
 
