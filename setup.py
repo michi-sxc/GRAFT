@@ -281,6 +281,21 @@ setup(
                 SetupLogger.log("Please install R manually for your operating system.", 'ERROR')
                 return
 
+        # Install system dependencies required by R packages
+        if platform.system() == 'Linux':
+            SetupLogger.log("Installing system dependencies for R packages...", 'INFO')
+            system_packages = [
+                'libxml2-dev',
+                'libcurl4-openssl-dev',
+                'libssl-dev',
+                'libblas-dev',
+                'liblapack-dev',
+                'gfortran',
+                'r-base-dev',
+                'r-recommended',
+            ]
+            CommandExecutor.run_command(['sudo', 'apt-get', 'install', '-y'] + system_packages)
+
         # Ensure R user library path exists
         try:
             r_libs_user = subprocess.check_output(
