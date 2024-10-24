@@ -3627,9 +3627,19 @@ def update_file_store(contents, filenames, store_data, current_selection):
 
 
 def update_histograms(
-    selected_file, store_data, mapq_range, selected_nm, ct_checklist, ct_count_value,
-    min_base_quality, read_length_selectedData, read_length_clickData, clear_selection_nclicks, sequencing_type,
-    current_selected_lengths, current_fig
+    selected_file, 
+    store_data, 
+    mapq_range, 
+    selected_nm, 
+    ct_checklist, 
+    ct_count_value,
+    min_base_quality, 
+    read_length_selectedData, 
+    read_length_clickData, 
+    clear_selection_nclicks, 
+    sequencing_type,
+    current_selected_lengths, 
+    current_fig
 ):
     # Check if no file is selected
     if selected_file is None:
@@ -3688,8 +3698,20 @@ def update_histograms(
         empty_text = ""
         return (
             empty_figure, empty_figure, empty_figure, empty_figure, [],
-            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+            empty_figure, empty_figure, empty_text, empty_figure, empty_figure, empty_figure
         )
+
+    # Initialize default empty figures for mismatch-related plots
+    empty_mismatch_fig = go.Figure().update_layout(
+        title='Mismatch Frequency Not Available for This File Format',
+        xaxis=dict(title='', color=colors['muted']),
+        yaxis=dict(title='', color=colors['muted']),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted'])
+    )
+    mismatch_freq_fig = empty_mismatch_fig
+    old_mismatch_freq_fig = empty_mismatch_fig
 
     # Adjust the call to load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
@@ -3701,24 +3723,18 @@ def update_histograms(
     if file_format in ['bam', 'sam']:
         frequencies = calculate_mismatch_frequency(read_lengths, file_format, sequencing_type)
         frequencies_old = calculate_mismatch_frequency_old(read_lengths, file_format)
-        mismatch_freq_fig = create_mismatch_frequency_plot(frequencies, sequencing_type)
-        old_mismatch_freq_fig = create_mismatch_frequency_plot_old(frequencies_old)
+        if frequencies:
+            mismatch_freq_fig = create_mismatch_frequency_plot(frequencies, sequencing_type)
+        if frequencies_old:
+            old_mismatch_freq_fig = create_mismatch_frequency_plot_old(frequencies_old)
     else:
         frequencies = None
-        mismatch_freq_fig = go.Figure().update_layout(
-            title='Mismatch Frequency Not Available for This File Format',
-            xaxis=dict(title='', color=colors['muted']),
-            yaxis=dict(title='', color=colors['muted']),
-            paper_bgcolor=colors['plot_bg'],
-            plot_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
+        frequencies_old = None
 
     bin_centers, hist, bins = prepare_histogram_data(read_lengths)
 
     # Create read length histogram with uirevision
     read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
-
 
     overall_cg_content = calculate_overall_cg_content(read_lengths)
     overall_cg_fig = go.Figure()
@@ -3754,7 +3770,11 @@ def update_histograms(
     temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
     stats = calculate_alignment_stats(temp_file_path, file_format)
 
-    # set filters to mismatches
+    # Initialize empty figures for mismatch type and damage pattern
+    mismatch_type_fig = go.Figure()
+    damage_pattern_fig = go.Figure()
+
+    # Set filters to mismatches
     if stats.get('Mismatch Details') != 'N/A':
         filtered_mismatches = filter_mismatches(
             stats['Mismatch Details'],
@@ -3770,9 +3790,6 @@ def update_histograms(
         # Plotting
         mismatch_type_fig = create_mismatch_type_bar_chart(filtered_mismatch_counts)
         damage_pattern_fig = create_damage_pattern_plot(filtered_mismatches)
-    else:
-        mismatch_type_fig = go.Figure()
-        damage_pattern_fig = go.Figure()
 
     # Data summary after generating all plots
     read_length_text = get_read_length_data(read_lengths)
@@ -3782,6 +3799,7 @@ def update_histograms(
     stats_text = get_alignment_stats_text(stats)
     read_length_cg_average_text = get_read_length_CG_average(read_lengths)
     filter_options_text = get_filter_options_text(selected_nm, ct_checklist, ct_count_value, mapq_range_tuple)
+    
     selected_cg_contents = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
     if selected_cg_contents:
         cg_series = pd.Series(selected_cg_contents)
