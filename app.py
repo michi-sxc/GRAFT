@@ -11,6 +11,7 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
+from plotly.subplots import make_subplots
 import dash_dangerously_set_inner_html
 import plotly.graph_objects as go
 import plotly.express as px
@@ -31,6 +32,7 @@ import dust_module
 
 
 from tasks import celery_app, run_mapdamage_task, run_centrifuge_task
+from pages import simulation
 
 ###############################################################################################
 
@@ -120,7 +122,15 @@ def save_uploaded_file(content, filename):
         f.write(decoded)
     return file_path
 
+def complement_base(base):
+    base = base.upper()
+    complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
+    return complement.get(base, 'N')
 
+def reverse_complement(seq):
+    complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
+    reversed_seq = reversed(seq.upper())
+    return ''.join([complement.get(base, 'N') for base in reversed_seq])
 
 def parse_misincorporation(file_path):
     df = pd.read_csv(file_path, sep='\t', comment='#')
@@ -181,6 +191,63 @@ def display_certainty_metrics(mcmc_df):
         html.P(f"Misincorporation Rate (delta): {misincorporation_rate:.4f}"),
         html.P(f"Fragmentation Rate (lambda): {fragmentation_rate:.4f}")
     ])
+
+def extract_mismatches(read):
+    """
+    Extract mismatches from a read using the MD tag and CIGAR string.
+    Returns a list of dictionaries with keys 'position', 'ref_base', 'read_base'.
+    Positions are adjusted based on the read's orientation.
+    """
+    try:
+        md_tag = read.get_tag('MD')
+    except KeyError:
+        # MD tag not present
+        return []
+
+    # Initialize variables
+    mismatches = []
+    query_sequence = read.query_sequence
+    if query_sequence is None:
+        return []
+    if read.is_reverse:
+        query_sequence = reverse_complement(query_sequence)
+
+    cigar_tuples = read.cigartuples
+    md_string = md_tag
+    seq_pos = 0  # Position in query_sequence
+    ref_pos = 0  # Position in reference
+
+    import re
+    md_tokens = re.findall(r'(\d+|\^[A-Z]+|[A-Z])', md_string)
+
+    for token in md_tokens:
+        if token.isdigit():
+            num_matches = int(token)
+            seq_pos += num_matches
+            ref_pos += num_matches
+        elif token.startswith('^'):
+            # Deletion in reference (insertion in read)
+            deletion_length = len(token) - 1
+            ref_pos += deletion_length
+        else:
+            # Mismatch
+            ref_base = token
+            if seq_pos >= len(query_sequence):
+                break
+            read_base = query_sequence[seq_pos]
+            mismatch = {
+                'position': seq_pos,
+                'ref_base': ref_base,
+                'read_base': read_base,
+                'strand': '-' if read.is_reverse else '+'
+            }
+            mismatches.append(mismatch)
+            seq_pos += 1
+            ref_pos += 1
+
+    return mismatches
+
+
 
 
 ################################
@@ -578,6 +645,135 @@ def get_mismatch_pattern(read):
     return mismatch_counts
 
 
+def calculate_mismatch_frequency_old(read_lengths, file_format):
+    if file_format not in ['bam', 'sam']:
+        return None  # Mismatch frequency is not applicable
+
+    # Initialize arrays to store mismatch counts at each distance
+    max_distance = 30  # Define maximum distance to consider, can be changed
+    counts = {'C>T': [0] * max_distance, 'G>A': [0] * max_distance, 'other': [0] * max_distance}
+    total_reads = len(read_lengths)
+
+    if total_reads == 0:
+        return None  # No reads to process
+
+    # Iterate over each read to count mismatches by position
+    for _, _, _, _, read, _ in read_lengths:
+        mismatches = get_mismatch_pattern(read)
+        if not mismatches:
+            continue  
+        for mismatch_type, count in mismatches.items():
+            if mismatch_type in counts:
+                for position in range(min(len(counts[mismatch_type]), count)):
+                    counts[mismatch_type][position] += 1
+            else:
+                for position in range(min(len(counts['other']), count)):
+                    counts['other'][position] += 1
+
+    if sum(sum(v) for v in counts.values()) == 0:
+        return None  # No mismatches found
+
+    # Normalize counts to calculate frequency
+    frequencies = {key: [c / total_reads for c in counts[key]] for key in counts}
+    return frequencies
+
+
+def create_mismatch_frequency_plot_old(frequencies):
+    if not frequencies:
+        fig = go.Figure()
+        fig.update_layout(
+            title_text="Mismatch Frequency Data Not Available",
+            paper_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+        return fig
+    
+    fig = go.Figure()
+
+    # Define the distance range
+    x_values = list(range(len(frequencies['C>T'])))
+
+    # traces for each type, not really consistent with the rest of the styling theme
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=frequencies['C>T'],
+        mode='lines+markers',
+        name='C>T',
+        line=dict(color=colors['line'], width=2, dash='solid'),
+        marker=dict(size=6, color=colors['line'], symbol='circle')
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=frequencies['G>A'],
+        mode='lines+markers',
+        name='G>A',
+        line=dict(color=colors['highlight'], width=2, dash='dash'),
+        marker=dict(size=6, color=colors['highlight'], symbol='square')
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=frequencies['other'],
+        mode='lines+markers',
+        name='Other',
+        line=dict(color=colors['highlight2'], width=2, dash='dot'),
+        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
+    ))
+
+    
+    fig.update_layout(
+        title=dict(
+            text='OLD: Mismatch Frequency (per read) vs Distance from Read End',
+            font=dict(size=20, color=colors['muted']),
+            x=0.5,
+            y=0.95
+        ),
+        xaxis=dict(
+            title='Distance from Read End (bp)',
+            color=colors['muted'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title='Mismatch Frequency',
+            color=colors['primary'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+            rangemode='tozero',
+        ),
+        legend=dict(
+            x=0.85,
+            y=1.15,
+            bgcolor='rgba(0, 0, 0, 0.5)',
+            bordercolor='rgba(255, 255, 255, 0.3)',
+            borderwidth=1,
+            font=dict(color=colors['muted'])
+        ),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        dragmode='select',
+        selectdirection='h',
+        newselection_line_width=2,
+        newselection_line_color=colors['secondary'],
+        newselection_line_dash='dashdot',
+        margin=dict(t=50, b=50, l=50, r=50)
+    )
+
+    
+    fig.update_traces(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
+
+    return fig
+
+
 def calculate_cg_content(sequence):
     if len(sequence) == 0:
         return 0
@@ -824,40 +1020,182 @@ def calculate_mean_cg_content(read_lengths, bins):
     return mean_cg_contents
 
 
-def calculate_mismatch_frequency(read_lengths, file_format):
-    if file_format not in ['bam', 'sam']:
-        return None  # Mismatch frequency is not applicable
+def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
+    if sequencing_type == 'single':
+        # Existing code to calculate frequencies from one end
+        frequencies = calculate_single_end_mismatch_frequency(read_lengths)
+    elif sequencing_type == 'double':
+        # Calculate frequencies from both ends
+        frequencies = calculate_double_end_mismatch_frequency(read_lengths)
+    else:
+        frequencies = {}
+    return frequencies
 
-    # Initialize arrays to store mismatch counts at each distance
-    max_distance = 30  # Define maximum distance to consider, can be changed
-    counts = {'C>T': [0] * max_distance, 'G>A': [0] * max_distance, 'other': [0] * max_distance}
-    total_reads = len(read_lengths)
+def calculate_single_end_mismatch_frequency(read_lengths):
+    max_distance = 50  # Adjust as needed
+    counts = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
+    total_bases = [0]*max_distance
 
-    if total_reads == 0:
-        return None  # No reads to process
+    for read_tuple in read_lengths:
+        read = read_tuple[4]  # Access the read object
+        sequence = read.query_sequence
+        if sequence is None:
+            continue
+        seq_length = len(sequence)
 
-    # Iterate over each read to count mismatches by position
-    for _, _, _, _, read, _ in read_lengths:
-        mismatches = get_mismatch_pattern(read)
-        if not mismatches:
-            continue  
-        for mismatch_type, count in mismatches.items():
-            if mismatch_type in counts:
-                for position in range(min(len(counts[mismatch_type]), count)):
-                    counts[mismatch_type][position] += 1
+        if read.is_reverse:
+            orientation = 'reverse'
+            sequence = reverse_complement(sequence)
+        else:
+            orientation = 'forward'
+
+        # Get aligned positions and mismatches
+        aligned_pairs = read.get_aligned_pairs(with_seq=True)
+        for query_pos, ref_pos, ref_base in aligned_pairs:
+            if query_pos is None or ref_pos is None:
+                continue  # Skip insertions and deletions
+            if query_pos >= seq_length:
+                continue
+            if orientation == 'reverse':
+                dist = seq_length - query_pos - 1  # Distance from 5' end for reverse reads
             else:
-                for position in range(min(len(counts['other']), count)):
-                    counts['other'][position] += 1
+                dist = query_pos  # Distance from 5' end for forward reads
 
-    if sum(sum(v) for v in counts.values()) == 0:
-        return None  # No mismatches found
+            if dist >= max_distance:
+                continue
 
-    # Normalize counts to calculate frequency
-    frequencies = {key: [c / total_reads for c in counts[key]] for key in counts}
+            # Increment total bases at this position
+            total_bases[dist] += 1
+
+            read_base = sequence[query_pos]
+            if ref_base.upper() != read_base.upper():
+                # Mismatch
+                if read.is_reverse:
+                    # Complement bases for reverse reads
+                    ref_base = complement_base(ref_base)
+                    read_base = complement_base(read_base)
+                key = f"{ref_base.upper()}>{read_base.upper()}"
+                if key == 'C>T':
+                    counts['C>T'][dist] += 1
+                elif key == 'G>A':
+                    counts['G>A'][dist] += 1
+                else:
+                    counts['other'][dist] += 1
+            # Else, it's a match, and total_bases[dist] has already been incremented
+
+    # Calculate frequencies
+    frequencies = {}
+    for key in counts:
+        frequencies[key] = [
+            counts[key][i] / total_bases[i] if total_bases[i] > 0 else 0
+            for i in range(max_distance)
+        ]
+
     return frequencies
 
 
-def create_mismatch_frequency_plot(frequencies):
+
+
+
+def calculate_double_end_mismatch_frequency(read_lengths):
+    max_distance = 30
+    counts_5p = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
+    counts_3p = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
+    total_bases_5p = [0]*max_distance
+    total_bases_3p = [0]*max_distance
+
+    for read_tuple in read_lengths:
+        read = read_tuple[4]  # Read object
+        sequence = read.query_sequence
+        if sequence is None:
+            continue
+        seq_length = len(sequence)
+
+        if read.is_reverse:
+            orientation = 'reverse'
+            sequence = reverse_complement(sequence)
+        else:
+            orientation = 'forward'
+
+        # Get aligned positions and mismatches
+        aligned_pairs = read.get_aligned_pairs(with_seq=True)
+        for query_pos, ref_pos, ref_base in aligned_pairs:
+            if query_pos is None or ref_pos is None:
+                continue  # Skip insertions and deletions
+            if query_pos >= seq_length:
+                continue
+
+            if orientation == 'reverse':
+                dist_5p = seq_length - query_pos - 1
+                dist_3p = query_pos
+            else:
+                dist_5p = query_pos
+                dist_3p = seq_length - query_pos - 1
+
+            # Process 5' end
+            if dist_5p < max_distance:
+                total_bases_5p[dist_5p] += 1
+                read_base = sequence[query_pos]
+                if read.is_reverse:
+                    ref_base_adj = complement_base(ref_base)
+                    read_base_adj = complement_base(read_base)
+                else:
+                    ref_base_adj = ref_base
+                    read_base_adj = read_base
+
+                if ref_base_adj.upper() != read_base_adj.upper():
+                    key = f"{ref_base_adj.upper()}>{read_base_adj.upper()}"
+                    if key == 'C>T':
+                        counts_5p['C>T'][dist_5p] += 1
+                    elif key == 'G>A':
+                        counts_5p['G>A'][dist_5p] += 1
+                    else:
+                        counts_5p['other'][dist_5p] += 1
+
+            # Process 3' end
+            if dist_3p < max_distance:
+                total_bases_3p[dist_3p] += 1
+                read_base = sequence[query_pos]
+                if read.is_reverse:
+                    ref_base_adj = complement_base(ref_base)
+                    read_base_adj = complement_base(read_base)
+                else:
+                    ref_base_adj = ref_base
+                    read_base_adj = read_base
+
+                if ref_base_adj.upper() != read_base_adj.upper():
+                    key = f"{ref_base_adj.upper()}>{read_base_adj.upper()}"
+                    if key == 'C>T':
+                        counts_3p['C>T'][dist_3p] += 1
+                    elif key == 'G>A':
+                        counts_3p['G>A'][dist_3p] += 1
+                    else:
+                        counts_3p['other'][dist_3p] += 1
+
+    # Calculate frequencies for 5' end
+    frequencies_5p = {}
+    for key in counts_5p:
+        frequencies_5p[key] = [
+            counts_5p[key][i] / total_bases_5p[i] if total_bases_5p[i] > 0 else 0
+            for i in range(max_distance)
+        ]
+
+    # Calculate frequencies for 3' end
+    frequencies_3p = {}
+    for key in counts_3p:
+        frequencies_3p[key] = [
+            counts_3p[key][i] / total_bases_3p[i] if total_bases_3p[i] > 0 else 0
+            for i in range(max_distance)
+        ]
+
+    frequencies = {'5_prime': frequencies_5p, '3_prime': frequencies_3p}
+    return frequencies
+
+
+
+
+
+def create_mismatch_frequency_plot(frequencies, sequencing_type):
     if not frequencies:
         fig = go.Figure()
         fig.update_layout(
@@ -866,13 +1204,22 @@ def create_mismatch_frequency_plot(frequencies):
             font=dict(color=colors['muted'])
         )
         return fig
-    
-    fig = go.Figure()
 
-    # Define the distance range
+    if sequencing_type == 'single':
+        # Existing plotting code for single-stranded sequencing
+        fig = plot_single_end_mismatch_frequency(frequencies)
+    elif sequencing_type == 'double':
+        # New plotting code for double-stranded sequencing
+        fig = plot_double_end_mismatch_frequency(frequencies)
+    else:
+        fig = go.Figure()
+    return fig
+
+def plot_single_end_mismatch_frequency(frequencies):
+    fig = go.Figure()
     x_values = list(range(len(frequencies['C>T'])))
 
-    # traces for each type, not really consistent with the rest of the styling theme
+    # Trace for 'C>T' mismatches
     fig.add_trace(go.Scatter(
         x=x_values,
         y=frequencies['C>T'],
@@ -882,6 +1229,7 @@ def create_mismatch_frequency_plot(frequencies):
         marker=dict(size=6, color=colors['line'], symbol='circle')
     ))
 
+    # Trace for 'G>A' mismatches
     fig.add_trace(go.Scatter(
         x=x_values,
         y=frequencies['G>A'],
@@ -891,6 +1239,7 @@ def create_mismatch_frequency_plot(frequencies):
         marker=dict(size=6, color=colors['highlight'], symbol='square')
     ))
 
+    # Trace for 'other' mismatches
     fig.add_trace(go.Scatter(
         x=x_values,
         y=frequencies['other'],
@@ -900,7 +1249,7 @@ def create_mismatch_frequency_plot(frequencies):
         marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
     ))
 
-    
+    # Update layout
     fig.update_layout(
         title=dict(
             text='Mismatch Frequency (per read) vs Distance from Read End',
@@ -947,10 +1296,153 @@ def create_mismatch_frequency_plot(frequencies):
         margin=dict(t=50, b=50, l=50, r=50)
     )
 
-    
+    # Update hover templates
     fig.update_traces(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
 
     return fig
+
+def plot_double_end_mismatch_frequency(frequencies):
+    # Create subplots with two columns
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("5' End", "3' End"))
+
+    # Frequencies for 5' end
+    x_values_5p = list(range(len(frequencies['5_prime']['C>T'])))
+    # Frequencies for 3' end
+    x_values_3p = list(range(len(frequencies['3_prime']['C>T'])))
+
+    # Plotting for 5' end
+    # Trace for 'C>T' mismatches at 5' end
+    fig.add_trace(go.Scatter(
+        x=x_values_5p,
+        y=frequencies['5_prime']['C>T'],
+        mode='lines+markers',
+        name='C>T (5\')',
+        line=dict(color=colors['line'], width=2, dash='solid'),
+        marker=dict(size=6, color=colors['line'], symbol='circle')
+    ), row=1, col=1)
+
+    # Trace for 'G>A' mismatches at 5' end
+    fig.add_trace(go.Scatter(
+        x=x_values_5p,
+        y=frequencies['5_prime']['G>A'],
+        mode='lines+markers',
+        name='G>A (5\')',
+        line=dict(color=colors['highlight'], width=2, dash='dash'),
+        marker=dict(size=6, color=colors['highlight'], symbol='square')
+    ), row=1, col=1)
+
+    # Trace for 'other' mismatches at 5' end
+    fig.add_trace(go.Scatter(
+        x=x_values_5p,
+        y=frequencies['5_prime']['other'],
+        mode='lines+markers',
+        name='Other (5\')',
+        line=dict(color=colors['highlight2'], width=2, dash='dot'),
+        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
+    ), row=1, col=1)
+
+    # Plotting for 3' end
+    # Trace for 'C>T' mismatches at 3' end
+    fig.add_trace(go.Scatter(
+        x=x_values_3p,
+        y=frequencies['3_prime']['C>T'],
+        mode='lines+markers',
+        name='C>T (3\')',
+        line=dict(color=colors['line'], width=2, dash='solid'),
+        marker=dict(size=6, color=colors['line'], symbol='circle')
+    ), row=1, col=2)
+
+    # Trace for 'G>A' mismatches at 3' end
+    fig.add_trace(go.Scatter(
+        x=x_values_3p,
+        y=frequencies['3_prime']['G>A'],
+        mode='lines+markers',
+        name='G>A (3\')',
+        line=dict(color=colors['highlight'], width=2, dash='dash'),
+        marker=dict(size=6, color=colors['highlight'], symbol='square')
+    ), row=1, col=2)
+
+    # Trace for 'other' mismatches at 3' end
+    fig.add_trace(go.Scatter(
+        x=x_values_3p,
+        y=frequencies['3_prime']['other'],
+        mode='lines+markers',
+        name='Other (3\')',
+        line=dict(color=colors['highlight2'], width=2, dash='dot'),
+        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
+    ), row=1, col=2)
+
+    # Update layout
+    fig.update_layout(
+        title=dict(
+            text='Mismatch Frequency (per read) vs Distance from Read Ends',
+            font=dict(size=20, color=colors['muted']),
+            x=0.5,
+            y=0.95
+        ),
+        # Update x-axes
+        xaxis=dict(
+            title='Distance from 5\' End (bp)',
+            color=colors['muted'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+        ),
+        xaxis2=dict(
+            title='Distance from 3\' End (bp)',
+            color=colors['muted'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+        ),
+        # Update y-axes
+        yaxis=dict(
+            title='Mismatch Frequency',
+            color=colors['primary'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+            rangemode='tozero',
+        ),
+        yaxis2=dict(
+            title='Mismatch Frequency',
+            color=colors['primary'],
+            tickfont=dict(size=12, color=colors['muted']),
+            gridcolor=colors['grid'],
+            showline=True,
+            linewidth=1,
+            linecolor=colors['primary'],
+            zeroline=False,
+            rangemode='tozero',
+        ),
+        legend=dict(
+            x=1.05,
+            y=1,
+            bgcolor='rgba(0, 0, 0, 0)',
+            bordercolor='rgba(0, 0, 0, 0)',
+            font=dict(color=colors['muted'])
+        ),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted']),
+        margin=dict(t=50, b=50, l=50, r=50)
+    )
+
+    # Update hover templates for all traces
+    for trace in fig.data:
+        trace.update(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
+
+    return fig
+
 
 def display_mapdamage_results(output_dir):
     try:
@@ -1106,18 +1598,43 @@ def get_damage_patterns_data(five_prime_end, three_prime_end):
         text_output += f"Base {base}: {count} occurrences\n"
     return text_output
 
-def get_mismatch_frequency_data(frequencies):
+def get_mismatch_frequency_data(frequencies, sequencing_type):
     if not frequencies:
         return "Mismatch frequency data not available for this file format.\n"
-    text_output = "Mismatch Frequency vs Distance from Read End:\n"
-    max_distance = len(frequencies['C>T'])
-    text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
-    for i in range(max_distance):
-        ct_freq = frequencies['C>T'][i]
-        ga_freq = frequencies['G>A'][i]
-        other_freq = frequencies['other'][i]
-        text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+
+    if sequencing_type == 'single':
+        text_output = "Mismatch Frequency vs Distance from Read End:\n"
+        max_distance = len(frequencies['C>T'])
+        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        for i in range(max_distance):
+            ct_freq = frequencies['C>T'][i]
+            ga_freq = frequencies['G>A'][i]
+            other_freq = frequencies['other'][i]
+            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+    elif sequencing_type == 'double':
+        text_output = "Mismatch Frequency vs Distance from Read Ends:\n"
+        text_output += "\n5' End:\n"
+        max_distance_5p = len(frequencies['5_prime']['C>T'])
+        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        for i in range(max_distance_5p):
+            ct_freq = frequencies['5_prime']['C>T'][i]
+            ga_freq = frequencies['5_prime']['G>A'][i]
+            other_freq = frequencies['5_prime']['other'][i]
+            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+
+        text_output += "\n3' End:\n"
+        max_distance_3p = len(frequencies['3_prime']['C>T'])
+        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        for i in range(max_distance_3p):
+            ct_freq = frequencies['3_prime']['C>T'][i]
+            ga_freq = frequencies['3_prime']['G>A'][i]
+            other_freq = frequencies['3_prime']['other'][i]
+            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+    else:
+        text_output = "Unknown sequencing type.\n"
+
     return text_output
+
 
 def get_alignment_stats_text(stats):
     text_output = "Alignment Statistics:\n"
@@ -1668,13 +2185,13 @@ navbar = dbc.Navbar(
             href="/",
             style={"textDecoration": "none"},
         ),
-        dbc.NavItem(dbc.Button("Console", id="console-button", color="light", outline=True, className="me-2")),
         dbc.NavbarToggler(id="navbar-toggler"),
         dbc.Collapse(
             dbc.Nav([
                 dbc.NavItem(dcc.Link("Home", href="/", className="nav-link")),
+                dbc.NavItem(dcc.Link("Simulation", href="/simulation", className="nav-link")),
                 dbc.NavItem(dcc.Link("Convert", href="/convert", className="nav-link")),
-                dbc.NavItem(dcc.Link("File Viewer", href="/file-viewer", className="nav-link")), 
+                dbc.NavItem(dcc.Link("File Viewer", href="/file-viewer", className="nav-link")),
                 dbc.NavItem(dbc.Button("Settings", id="settings-button", color="light", outline=True)),
             ], className="ms-auto", navbar=True),
             id="navbar-collapse",
@@ -1759,6 +2276,17 @@ layout_main = dbc.Container([
                         value=None,
                         clearable=False,
                         placeholder="Select a file",
+                        className="mb-4",
+                    ),
+                    html.Label("Sequencing Type:", className="mt-3 mb-2"),
+                    dcc.RadioItems(
+                        id='sequencing-type',
+                        options=[
+                            {'label': ' Single-stranded', 'value': 'single'},
+                            {'label': ' Double-stranded', 'value': 'double'}
+                        ],
+                        value='single',
+                        labelStyle={'display': 'block'},
                         className="mb-4",
                     ),
                     html.H5("Filtering Options", className="mt-4 mb-3"),
@@ -1882,6 +2410,7 @@ layout_main = dbc.Container([
                                     dbc.Tab(dcc.Graph(id='cg-content-histogram'), label="CG Distribution"),
                                     dbc.Tab(dcc.Graph(id='damage-patterns'), label="Damage Patterns"),
                                     dbc.Tab(dcc.Graph(id='mismatch-frequency-plot'), label="Mismatch Frequency"),
+                                    dbc.Tab(dcc.Graph(id='mismatch-frequency-plot-old'), label="Mismatch Frequency (old)"),
                                     dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart'), label="Mismatch Types"),
                                     dbc.Tab(dcc.Graph(id='damage-pattern-plot'), label="Damage Patterns Along Reads"),
                                     dbc.Tab(dcc.Graph(id='mapq-histogram'), label="MAPQ Distribution"),
@@ -2073,6 +2602,8 @@ def enforce_mutual_exclusivity(selected_values):
 def display_page(pathname):
     if pathname == '/convert':
         return layout_convert
+    elif pathname == '/simulation':
+        return simulation.layout
     elif pathname == '/file-viewer':
         return layout_file_viewer  # New File Viewer layout
     else:
@@ -3069,6 +3600,7 @@ def update_file_store(contents, filenames, store_data, current_selection):
         Output('damage-patterns', 'figure'),
         Output('selected-lengths', 'data'),
         Output('mismatch-frequency-plot', 'figure'),
+        Output('mismatch-frequency-plot-old', 'figure'),
         Output('data-summary', 'children'),
         Output('mapq-histogram', 'figure'),
         Output('mismatch-type-bar-chart', 'figure'),
@@ -3084,7 +3616,8 @@ def update_file_store(contents, filenames, store_data, current_selection):
         Input('min-base-quality', 'value'),
         Input('read-length-histogram', 'selectedData'),
         Input('read-length-histogram', 'clickData'),
-        Input('clear-selection-button', 'n_clicks')
+        Input('clear-selection-button', 'n_clicks'),
+        Input('sequencing-type', 'value')
     ],
     [
         State('selected-lengths', 'data'),
@@ -3095,7 +3628,7 @@ def update_file_store(contents, filenames, store_data, current_selection):
 
 def update_histograms(
     selected_file, store_data, mapq_range, selected_nm, ct_checklist, ct_count_value,
-    min_base_quality, read_length_selectedData, read_length_clickData, clear_selection_nclicks,
+    min_base_quality, read_length_selectedData, read_length_clickData, clear_selection_nclicks, sequencing_type,
     current_selected_lengths, current_fig
 ):
     # Check if no file is selected
@@ -3104,7 +3637,7 @@ def update_histograms(
         empty_text = ""
         return (
             empty_figure, empty_figure, empty_figure, empty_figure, [],
-            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+            empty_figure, empty_figure, empty_text, empty_figure, empty_figure, empty_figure
         )
 
     # Initialize selected_lengths
@@ -3166,8 +3699,10 @@ def update_histograms(
 
     # Handle mismatch frequency based on file format
     if file_format in ['bam', 'sam']:
-        frequencies = calculate_mismatch_frequency(read_lengths, file_format)
-        mismatch_freq_fig = create_mismatch_frequency_plot(frequencies)
+        frequencies = calculate_mismatch_frequency(read_lengths, file_format, sequencing_type)
+        frequencies_old = calculate_mismatch_frequency_old(read_lengths, file_format)
+        mismatch_freq_fig = create_mismatch_frequency_plot(frequencies, sequencing_type)
+        old_mismatch_freq_fig = create_mismatch_frequency_plot_old(frequencies_old)
     else:
         frequencies = None
         mismatch_freq_fig = go.Figure().update_layout(
@@ -3183,6 +3718,7 @@ def update_histograms(
 
     # Create read length histogram with uirevision
     read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
+
 
     overall_cg_content = calculate_overall_cg_content(read_lengths)
     overall_cg_fig = go.Figure()
@@ -3242,7 +3778,7 @@ def update_histograms(
     read_length_text = get_read_length_data(read_lengths)
     cg_content_text = get_overall_cg_content_data(read_lengths)
     damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
-    mismatch_frequency_text = get_mismatch_frequency_data(frequencies)
+    mismatch_frequency_text = get_mismatch_frequency_data(frequencies, sequencing_type)
     stats_text = get_alignment_stats_text(stats)
     read_length_cg_average_text = get_read_length_CG_average(read_lengths)
     filter_options_text = get_filter_options_text(selected_nm, ct_checklist, ct_count_value, mapq_range_tuple)
@@ -3273,7 +3809,7 @@ def update_histograms(
     # Return updated figures and data
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
-        selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
+        selected_lengths, mismatch_freq_fig, old_mismatch_freq_fig, data_summary_text, mapq_fig,
         mismatch_type_fig, damage_pattern_fig
     )
 
