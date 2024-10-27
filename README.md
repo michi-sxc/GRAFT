@@ -1,273 +1,218 @@
 # GRAFT - Genomic Read Analysis and Filtering Tool
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation and Setup](#installation-and-setup)
-  - [Mac/Linux Users](#maclinux-users)
-  - [Windows Users (Using WSL)](#windows-users-using-wsl)
-  - [Opening WSL in VSCode](#opening-wsl-in-vscode)
-- [Usage](#usage)
-  - [Uploading Files](#uploading-files)
-  - [Data Filtering](#data-filtering)
-  - [Data Visualization](#data-visualization)
-  - [File Conversion](#file-conversion)
-  - [File Viewer](#file-viewer)
-  - [Centrifuge Analysis](#centrifuge-analysis)
-- [Configuration](#configuration)
-- [Folder Structure](#folder-structure)
-- [Known Issues](#known-issues)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
-
 ## Overview
 
+GRAFT is a Python-based toolkit for analyzing ancient DNA data through an interactive web interface. The application integrates sequence data visualization, quality assessment, and filtering capabilities specific to degraded DNA analysis. Built on Dash and Plotly, GRAFT processes BAM, SAM, FASTA, and FASTQ files with support for taxonomic classification through Centrifuge and post-mortem damage assessment via mapDamage2.
 
+## Core Functions
 
-GRAFT is an interactive toolkit written in Python for genomic data analysis especially for working with aDNA data, focusing on BAM, SAM, FASTA, and FASTQ files. Built with Dash and Plotly, GRAFT provides functionalities for data upload, visualization, filtering, and batch conversion of genomic read files. It supports exploring read length distributions, CG content, damage patterns, and mismatch frequencies. It supports taxonomic classification with Centrifuge. PMD modeling is implemented via mapDamage2. 
-## Features
+* Interactive sequence data visualization
+* Read quality and length distribution analysis
+* C>T transition pattern assessment
+* MAPQ-based filtering system
+* Cross-format file conversion
+* Integrated taxonomic classification
+* Post-mortem damage modeling
 
-- **Interactive Data Visualization**: Visualize read length distributions, CG content, damage patterns, and mismatch frequencies.
-- **Advanced Filtering**: Apply filters on Mapping Quality (MAPQ), read mismatch counts, and C>T changes.
-- **File Upload and Conversion**: Support for BAM, SAM, FASTA, and FASTQ files. Batch conversion between these formats.
-- **Centrifuge Integration**: Perform taxonomic classification on FASTQ files.
-- **mapDamage Integration**: PMD assessment with reference genomes.
+## Technical Requirements
 
-## Requirements
+* Python 3.9+
+* Redis server
+* Core dependencies:
+  ```
+  dash==2.17.1
+  dash-bootstrap-components==1.6.0
+  dash_dangerously_set_inner_html==0.0.2
+  dash-iconify==0.1.2
+  pysam==0.22.1
+  biopython==1.81
+  numpy==1.26.4
+  plotly==5.22.0
+  pandas==2.2.1
+  celery==5.4.0
+  PyYAML==6.0.2
+  ansi2html==1.9.2
+  ```
 
-- Python 3.9+
-- Dependencies (see `requirements.txt`):
-  - dash
-  - dash-bootstrap-components
-  - dash_dangerously_set_inner_html
-  - dash-iconify
-  - pysam
-  - biopython
-  - numpy
-  - plotly
-  - pandas
-  - celery
-  - redis
-  - yaml
-  - ansi2html
-- **Redis**: Required for Celery task queue.
-- **Centrifuge**: For taxonomic classification features only. Dashboard works perfectly fine without Centrifuge being installed.
+## Installation
 
-## Installation and Setup
+### Unix-Based Systems (Linux/MacOS)
 
-### Mac/Linux Users
-
-1. **Clone the repository**:
-
+1. Clone repository:
    ```bash
    git clone https://github.com/michi-sxc/GRAFT.git
    cd GRAFT
    ```
 
-2. **Install dependencies**:
-
+2. Set directory permissions:
    ```bash
-   pip install -r requirements.txt
+   chmod 755 .
+   chmod -R u+w .
    ```
 
-3. **Install and configure Redis (required for Celery)**:
-
-   - On Ubuntu/Debian:
-     ```bash
-     sudo apt-get install redis-server
-     ```
-   - On macOS using Homebrew:
-     ```bash
-     brew install redis
-     ```
-
-4. **Install Centrifuge (required for taxonomic classification)**:
-
-   - **Install Bioconda** (if not already installed):
-     ```bash
-     conda config --add channels defaults
-     conda config --add channels bioconda
-     conda config --add channels conda-forge
-     ```
-   - **Install Centrifuge**:
-     ```bash
-     conda install -c bioconda centrifuge
-     ```
-   - Alternatively, you can install Centrifuge from source following the instructions on the [Centrifuge GitHub repository](https://github.com/DaehwanKimLab/centrifuge).
-
-5. **Running the Application**:
-
-   - To start the dashboard, run:
-     ```bash
-     python app.py
-     ```
-     The dashboard will be accessible at [http://127.0.0.1:8050/](http://127.0.0.1:8050/).
-
-### Windows Users (Using WSL)
-
-1. **Install WSL (Windows Subsystem for Linux)**:
-
-   - Open PowerShell as Administrator and run:
-     ```powershell
-     wsl --install
-     ```
-   - Restart your computer if prompted.
-
-2. **Set up WSL**:
-
-   - Open a WSL terminal (e.g., Ubuntu).
-   - **Clone the repository**:
-     ```bash
-     git clone https://github.com/michi-sxc/GRAFT.git
-     cd GRAFT
-     ```
-
-3. **Install dependencies**:
-
+3. Execute setup:
    ```bash
-   pip install -r requirements.txt
+   python setup.py
    ```
 
-4. **Install and configure Redis**:
+### Windows (WSL)
 
-   - In the WSL terminal:
-     ```bash
-     sudo apt-get install redis-server
-     ```
+1. Install WSL:
+   ```powershell
+   wsl --install
+   ```
 
-5. **Install Centrifuge (required for taxonomic classification)**:
+2. Execute WSL setup:
+   ```bash
+   git clone https://github.com/michi-sxc/GRAFT.git
+   cd GRAFT
+   chmod 755 .
+   chmod -R u+w .
+   python setup.py
+   ```
 
-   - **Install Bioconda**:
-     ```bash
-     conda config --add channels defaults
-     conda config --add channels bioconda
-     conda config --add channels conda-forge
-     ```
-   - **Install Centrifuge**:
-     ```bash
-     conda install -c bioconda centrifuge
-     ```
+Note: If running under WSL on a Windows filesystem (NTFS), the setup script will automatically relocate the project to the WSL filesystem to ensure proper permissions handling.
 
-6. **Running the Application**:
+### File Permissions Structure
 
-   - Set the Centrifuge library folder in the `config.yaml`
+The setup creates the following permission structure:
+* Directory permissions: 755 (drwxr-xr-x)
+* Python files: 644 (-rw-r--r--)
+* Executable scripts: 755 (-rwxr-xr-x)
+* Config files: 644 (-rw-r--r--)
 
-   - To start the dashboard, run:
-     ```bash
-     python app.py
-     ```
-     The dashboard will be accessible at [http://127.0.0.1:8050/](http://127.0.0.1:8050/).
+## Usage Instructions
 
-**Further setup information**: Redis-server and Celery workers are automatically setup by the tool.
+### Data Analysis
 
-### Opening WSL in VSCode (optional):
+1. Upload sequence files through the web interface
+2. Select analysis parameters:
+   * MAPQ thresholds (0-255)
+   * Read length constraints
+   * Mismatch tolerances
+   * C>T transition filters
 
-1. **Install VSCode (if not already installed)**:
-   - Download and install [Visual Studio Code](https://code.visualstudio.com/).
+3. Export filtered data in BAM/SAM/FASTA/FASTQ format
 
-2. **Install the WSL Extension**:
-   - Open VSCode and go to the Extensions view by clicking on the Extensions icon in the Activity Bar on the side of the window.
-   - Search for "Remote - WSL" and click Install.
+### Sequence Visualization
 
-3. **Open the Project in WSL**:
-   - Open a WSL terminal and navigate to your project directory:
-     ```bash
-     cd /path/to/GRAFT
-     ```
-   - Launch VSCode from the terminal:
-     ```bash
-     code .
-     ```
-     This will open the project in VSCode with WSL integration, allowing you to edit and manage your project files seamlessly.
+* Read length distribution plots
+* GC content analysis
+* Damage pattern visualization
+* Quality score distribution
+* Mismatch frequency assessment
 
-## Usage
+### File Management
 
-### Uploading Files
+* Format conversion between BAM/SAM/FASTA/FASTQ
+* Batch processing capabilities
+* Automatic quality control
 
-- Click "Drag and Drop or Click to Select Files" to upload BAM, SAM, FASTA, or FASTQ files.
-- Uploaded files are displayed in the sidebar under "File Selection".
+### Advanced Features
 
-### Data Filtering
+* Centrifuge taxonomic classification (optional)
+* mapDamage2 integration for PMD assessment
+* Interactive filtering based on damage patterns
 
-- **MAPQ Range**: Adjust the slider to select mapping quality for filtering reads.
-- **Mismatch Filter**: Filter reads based on the number of mismatches (NM tag).
-- **C>T Change Filter**:
-  - Show only C>T changes: Display reads with C>T changes.
-  - Exclude C>T changed reads: Exclude reads with C>T changes.
-  - Subtract C>T changes from NM: Adjust the mismatch count by subtracting C>T changes.
+### Simulation Module
 
-### Data Visualization
+The simulation component generates synthetic ancient DNA sequences with configurable damage patterns and quality profiles.
 
-- Navigate through different tabs to view:
-  - Read Length Distribution
-  - CG Content Distribution
-  - Damage Patterns
-  - Mismatch Frequencies
-  - Alignment Statistics
+#### Simulation Parameters
 
-- **Interactive Plots**: Click and drag on the histograms to select specific ranges or data points. The selections will update the other visualizations accordingly (not working with read length distribution).
+* Fragment Length Distribution:
+  ```python
+  - Distribution type: Log-normal, Gamma, Bimodal
+  - Mean length
+  - Standard deviation
+  - Length boundaries
+  - Skewness and kurtosis
+  ```
 
-### File Conversion
+* Damage Patterns:
+  ```python
+  - Terminal C>T rates (0-100%)
+  - Terminal G>A rates (0-100%)
+  - Internal damage rates
+  - Position-specific decay patterns
+  ```
 
-- Navigate to the "Convert" tab to batch convert between BAM, SAM, FASTA, and FASTQ formats.
-- Upload files you wish to convert.
-- Select the desired output format.
-- Click "Convert Files" to start the conversion.
-- Converted files can be downloaded directly or as a ZIP archive if multiple files are converted.
-- Please note that fasta/q to BAM/SAM conversions will generate dummy headers and empty metadata as fasta/q files do not contain BAM/SAM specific data.
+* Quality Score Profiles:
+  ```python
+  - Mean quality (Phred scale)
+  - Terminal quality decay
+  - Distribution shape (Normal, Gamma, Beta)
+  ```
 
-### File Viewer
+* Environmental Factors:
+  ```python
+  - Temperature (-20°C to 50°C)
+  - pH level (3-10)
+  - Humidity (0-100%)
+  - Oxygen exposure
+  ```
 
-- Upload file on main analysis page.
-- Navigate to the "File Viewer" tab and select uploaded file to view genomic sequence data.
-- Full data filtering capabilities as on the main page.
-- Mismatched bases are visualized in color: orange for C>T transitions, red for all other mismatches.
+* Chemical Modifications:
+  ```python
+  - Oxidative damage rates
+  - Abasic sites
+  - Crosslinks
+  - CpG methylation effects
+  ```
 
-### Centrifuge Analysis
+* Structural Damage:
+  ```python
+  - Single-strand break rates
+  - Double-strand break rates
+  - Nick site preferences
+  ```
 
-- Select a FASTQ file from the "File Selection" dropdown.
-- Ensure the Centrifuge database path is correctly configured in the settings.
-- Click "Run Centrifuge Analysis" to perform taxonomic classification.
-- The results will be displayed once the analysis is complete.
+#### Simulation Output
+
+* BAM files with:
+  - Authentic ancient DNA damage patterns
+  - Position-specific quality scores
+  - Proper CIGAR strings
+  - MD tags reflecting damage patterns
+  - NM tags for mismatch counts
+  - Mapped quality scores
+
 
 ## Configuration
 
-- **Settings Panel**: Click "Settings" in the navigation bar to configure:
-  - **Theme**: Choose between Dark or Light mode.
-  - **Centrifuge Database Path**: Specify the path to your Centrifuge database.
-  - **Maximum Read Length**: Set the maximum read length for processing.
-  - **Minimum Quality Score**: Define the minimum base quality score for filtering.
+Edit `config.yaml` to set:
+```yaml
+centrifuge_db_path: /path/to/centrifuge/db
+max_threads: 4
+cache_size: 100
+```
 
-- **Config File**: Settings are saved in `config.yaml`. You can edit this file directly or through the Settings panel.
+## Temporary Files
 
-## Folder Structure
+GRAFT creates temporary files during operation in:
+* Linux/WSL: `/tmp/GRAFT_temp/`
+* MacOS: `/private/tmp/GRAFT_temp/`
 
-- `app.py`: Main application script.
-- `tasks.py`: Celery worker setup for Centrifuge and mapDamage integration.
-- `config.yaml`: Configuration file for application settings.
-- `requirements.txt`: Python dependencies.
-- `assets/`: Folder for custom CSS and assets used in the dashboard.
-- `templates/`: HTML templates for the Dash application.
-- `mapDamage/`: mapDamage2 integration. 
-- `README.md`: Project documentation.
+Ensure appropriate write permissions for these directories.
 
-## Known Issues
+## Performance Considerations
 
-- **Performance**: Processing large BAM files can be slow and may consume significant memory. Consider downsampling or using a machine with higher specifications.
-- **File Compatibility**: Ensure uploaded files conform to the appropriate format specifications. Corrupted or improperly formatted files may cause errors.
-- **Centrifuge Database**: The database for Centrifuge can be large. Ensure you have sufficient disk space and that the path is correctly set in the settings.
+* Memory usage scales with input file size
+* Recommended minimum: 8GB RAM
+* Processing speed dependent on CPU cores
 
-## Contributing
+## Issue Reporting
 
-Contributions are welcome! Please fork the repository and create a pull request with your improvements.
+Submit issues via GitHub with:
+* Input file characteristics
+* Error messages
+* System specifications
+* Steps to reproduce
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT License
 
 ## Contact
 
-For questions or suggestions, please contact [michael.schneider6@mailbox.tu-dresden.de](mailto:michael.schneider6@mailbox.tu-dresden.de).
+[michael.schneider6@mailbox.tu-dresden.de](mailto:michael.schneider6@mailbox.tu-dresden.de)
