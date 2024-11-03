@@ -31,9 +31,9 @@ import re
 import dust_module
 
 
-from tasks import celery_app, run_mapdamage_task, run_centrifuge_task
+from utils.tasks import celery_app, run_mapdamage_task, run_centrifuge_task
 from pages import simulation
-from files import TempDirectoryManager
+from utils.files import TempDirectoryManager
 
 ###############################################################################################
 
