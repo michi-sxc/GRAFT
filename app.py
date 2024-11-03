@@ -33,6 +33,7 @@ import dust_module
 
 from tasks import celery_app, run_mapdamage_task, run_centrifuge_task
 from pages import simulation
+from files import TempDirectoryManager
 
 ###############################################################################################
 
@@ -58,8 +59,9 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SOLAR, "/assets/custo
 
 
 # custom temp directory for storing the data (needs better implementation, but works fine)
-CUSTOM_TEMP_DIR = tempfile.mkdtemp()
-os.makedirs(CUSTOM_TEMP_DIR, exist_ok=True)
+temp_manager = TempDirectoryManager(max_age_hours=12)
+CUSTOM_TEMP_DIR = temp_manager.create_temp_dir()
+os.environ["TMPDIR"] = CUSTOM_TEMP_DIR
 
 # Set TMPDIR environment variable to ensure pysam uses the custom temporary directory
 os.environ["TMPDIR"] = CUSTOM_TEMP_DIR
@@ -645,135 +647,6 @@ def get_mismatch_pattern(read):
     return mismatch_counts
 
 
-def calculate_mismatch_frequency_old(read_lengths, file_format):
-    if file_format not in ['bam', 'sam']:
-        return None  # Mismatch frequency is not applicable
-
-    # Initialize arrays to store mismatch counts at each distance
-    max_distance = 30  # Define maximum distance to consider, can be changed
-    counts = {'C>T': [0] * max_distance, 'G>A': [0] * max_distance, 'other': [0] * max_distance}
-    total_reads = len(read_lengths)
-
-    if total_reads == 0:
-        return None  # No reads to process
-
-    # Iterate over each read to count mismatches by position
-    for _, _, _, _, read, _ in read_lengths:
-        mismatches = get_mismatch_pattern(read)
-        if not mismatches:
-            continue  
-        for mismatch_type, count in mismatches.items():
-            if mismatch_type in counts:
-                for position in range(min(len(counts[mismatch_type]), count)):
-                    counts[mismatch_type][position] += 1
-            else:
-                for position in range(min(len(counts['other']), count)):
-                    counts['other'][position] += 1
-
-    if sum(sum(v) for v in counts.values()) == 0:
-        return None  # No mismatches found
-
-    # Normalize counts to calculate frequency
-    frequencies = {key: [c / total_reads for c in counts[key]] for key in counts}
-    return frequencies
-
-
-def create_mismatch_frequency_plot_old(frequencies):
-    if not frequencies:
-        fig = go.Figure()
-        fig.update_layout(
-            title_text="Mismatch Frequency Data Not Available",
-            paper_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
-        return fig
-    
-    fig = go.Figure()
-
-    # Define the distance range
-    x_values = list(range(len(frequencies['C>T'])))
-
-    # traces for each type, not really consistent with the rest of the styling theme
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['C>T'],
-        mode='lines+markers',
-        name='C>T',
-        line=dict(color=colors['line'], width=2, dash='solid'),
-        marker=dict(size=6, color=colors['line'], symbol='circle')
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['G>A'],
-        mode='lines+markers',
-        name='G>A',
-        line=dict(color=colors['highlight'], width=2, dash='dash'),
-        marker=dict(size=6, color=colors['highlight'], symbol='square')
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['other'],
-        mode='lines+markers',
-        name='Other',
-        line=dict(color=colors['highlight2'], width=2, dash='dot'),
-        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
-    ))
-
-    
-    fig.update_layout(
-        title=dict(
-            text='OLD: Mismatch Frequency (per read) vs Distance from Read End',
-            font=dict(size=20, color=colors['muted']),
-            x=0.5,
-            y=0.95
-        ),
-        xaxis=dict(
-            title='Distance from Read End (bp)',
-            color=colors['muted'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-        ),
-        yaxis=dict(
-            title='Mismatch Frequency',
-            color=colors['primary'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-            rangemode='tozero',
-        ),
-        legend=dict(
-            x=0.85,
-            y=1.15,
-            bgcolor='rgba(0, 0, 0, 0.5)',
-            bordercolor='rgba(255, 255, 255, 0.3)',
-            borderwidth=1,
-            font=dict(color=colors['muted'])
-        ),
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        dragmode='select',
-        selectdirection='h',
-        newselection_line_width=2,
-        newselection_line_color=colors['secondary'],
-        newselection_line_dash='dashdot',
-        margin=dict(t=50, b=50, l=50, r=50)
-    )
-
-    
-    fig.update_traces(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
-
-    return fig
-
-
 def calculate_cg_content(sequence):
     if len(sequence) == 0:
         return 0
@@ -1019,180 +892,181 @@ def calculate_mean_cg_content(read_lengths, bins):
         mean_cg_contents.append(mean_cg)
     return mean_cg_contents
 
+def calculate_confidence_intervals(counts, total_bases, confidence_level=0.95):
+    """
+    Calculate binomial confidence intervals for mismatch frequencies.
+    
+    Parameters:
+    -----------
+    counts : array-like
+        Number of mismatches at each position
+    total_bases : array-like
+        Total number of bases at each position
+    confidence_level : float
+        Confidence level for interval calculation (default: 0.95)
+    
+    Returns:
+    --------
+    tuple : (lower_bounds, upper_bounds)
+        Arrays containing lower and upper confidence bounds
+    """
+    from scipy import stats
+    
+    frequencies = np.array(counts) / np.maximum(total_bases, 1)
+    z_score = stats.norm.ppf((1 + confidence_level) / 2)
+    
+    # Wilson score interval calculation
+    denominator = 1 + z_score**2/np.array(total_bases)
+    center = (frequencies + z_score**2/(2*np.array(total_bases))) / denominator
+    
+    spread = z_score * np.sqrt(
+        (frequencies * (1 - frequencies) + z_score**2/(4*np.array(total_bases))) / np.array(total_bases)
+    ) / denominator
+    
+    lower_bounds = np.maximum(0, center - spread)
+    upper_bounds = np.minimum(1, center + spread)
+    
+    return lower_bounds, upper_bounds
 
 def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
-    if sequencing_type == 'single':
-        # Existing code to calculate frequencies from one end
-        frequencies = calculate_single_end_mismatch_frequency(read_lengths)
-    elif sequencing_type == 'double':
-        # Calculate frequencies from both ends
-        frequencies = calculate_double_end_mismatch_frequency(read_lengths)
-    else:
-        frequencies = {}
-    return frequencies
-
-def calculate_single_end_mismatch_frequency(read_lengths):
-    max_distance = 50  # Adjust as needed
-    counts = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
-    total_bases = [0]*max_distance
+    if file_format not in ['bam', 'sam']:
+        return {}
+        
+    max_distance = 50  # Standard distance from read ends to analyze
+    counts = {
+        '5_prime': {
+            'C>T_counts': [0]*max_distance, 
+            'G>A_counts': [0]*max_distance, 
+            'other_counts': [0]*max_distance,
+            'C>T': [0]*max_distance, 
+            'G>A': [0]*max_distance, 
+            'other': [0]*max_distance,
+            'total_bases': [0]*max_distance
+        },
+        '3_prime': {
+            'C>T_counts': [0]*max_distance, 
+            'G>A_counts': [0]*max_distance, 
+            'other_counts': [0]*max_distance,
+            'C>T': [0]*max_distance, 
+            'G>A': [0]*max_distance, 
+            'other': [0]*max_distance,
+            'total_bases': [0]*max_distance
+        }
+    }
 
     for read_tuple in read_lengths:
-        read = read_tuple[4]  # Access the read object
+        read = read_tuple[4]  # Get read object from tuple
+        if read.is_unmapped:
+            continue
+            
         sequence = read.query_sequence
         if sequence is None:
             continue
+            
         seq_length = len(sequence)
-
-        if read.is_reverse:
-            orientation = 'reverse'
-            sequence = reverse_complement(sequence)
-        else:
-            orientation = 'forward'
+        if seq_length == 0:
+            continue
 
         # Get aligned positions and mismatches
         aligned_pairs = read.get_aligned_pairs(with_seq=True)
+        if not aligned_pairs:
+            continue
+
         for query_pos, ref_pos, ref_base in aligned_pairs:
-            if query_pos is None or ref_pos is None:
-                continue  # Skip insertions and deletions
+            if query_pos is None or ref_pos is None or ref_base is None:
+                continue  # Skip insertions/deletions
+                
             if query_pos >= seq_length:
                 continue
-            if orientation == 'reverse':
-                dist = seq_length - query_pos - 1  # Distance from 5' end for reverse reads
-            else:
-                dist = query_pos  # Distance from 5' end for forward reads
 
-            if dist >= max_distance:
-                continue
+            read_base = sequence[query_pos].upper()
+            ref_base = ref_base.upper()
+            
+            # Calculate positions from both ends
+            dist_5p = query_pos
+            dist_3p = seq_length - query_pos - 1
+            
+            if dist_5p < max_distance:
+                counts['5_prime']['total_bases'][dist_5p] += 1
+                if read_base != ref_base:
+                    if read.is_reverse:
+                        if ref_base == 'G' and read_base == 'A':
+                            counts['5_prime']['G>A_counts'][dist_5p] += 1
+                        else:
+                            counts['5_prime']['other_counts'][dist_5p] += 1
+                    else:
+                        if ref_base == 'C' and read_base == 'T':
+                            counts['5_prime']['C>T_counts'][dist_5p] += 1
+                        else:
+                            counts['5_prime']['other_counts'][dist_5p] += 1
 
-            # Increment total bases at this position
-            total_bases[dist] += 1
-
-            read_base = sequence[query_pos]
-            if ref_base.upper() != read_base.upper():
-                # Mismatch
-                if read.is_reverse:
-                    # Complement bases for reverse reads
-                    ref_base = complement_base(ref_base)
-                    read_base = complement_base(read_base)
-                key = f"{ref_base.upper()}>{read_base.upper()}"
-                if key == 'C>T':
-                    counts['C>T'][dist] += 1
-                elif key == 'G>A':
-                    counts['G>A'][dist] += 1
-                else:
-                    counts['other'][dist] += 1
-            # Else, it's a match, and total_bases[dist] has already been incremented
+            if dist_3p < max_distance:
+                counts['3_prime']['total_bases'][dist_3p] += 1
+                if read_base != ref_base:
+                    if read.is_reverse:
+                        if ref_base == 'C' and read_base == 'T':
+                            counts['3_prime']['C>T_counts'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['other_counts'][dist_3p] += 1
+                    else:
+                        if ref_base == 'G' and read_base == 'A':
+                            counts['3_prime']['G>A_counts'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['other_counts'][dist_3p] += 1
 
     # Calculate frequencies
     frequencies = {}
-    for key in counts:
-        frequencies[key] = [
-            counts[key][i] / total_bases[i] if total_bases[i] > 0 else 0
-            for i in range(max_distance)
-        ]
+    
+    if sequencing_type == 'single':
+        frequencies = {
+            'C>T': [], 'G>A': [], 'other': [],
+            'C>T_counts': [], 'G>A_counts': [], 'other_counts': [],
+            'total_bases': []
+        }
+        
+        for i in range(max_distance):
+            total_5p = counts['5_prime']['total_bases'][i]
+            total_3p = counts['3_prime']['total_bases'][i]
+            
+            frequencies['total_bases'].append(total_5p + total_3p)
+            
+            for mut_type in ['C>T', 'G>A', 'other']:
+                count_5p = counts['5_prime'][f'{mut_type}_counts'][i]
+                count_3p = counts['3_prime'][f'{mut_type}_counts'][i]
+                
+                frequencies[f'{mut_type}_counts'].append(count_5p + count_3p)
+                if frequencies['total_bases'][-1] > 0:
+                    frequencies[mut_type].append(
+                        (count_5p + count_3p) / frequencies['total_bases'][-1]
+                    )
+                else:
+                    frequencies[mut_type].append(0)
+    else:
+        frequencies = {
+            '5_prime': {},
+            '3_prime': {}
+        }
+        
+        for end in ['5_prime', '3_prime']:
+            frequencies[end] = {
+                'C>T': [], 'G>A': [], 'other': [],
+                'C>T_counts': [], 'G>A_counts': [], 'other_counts': [],
+                'total_bases': counts[end]['total_bases']
+            }
+            
+            for i in range(max_distance):
+                total = counts[end]['total_bases'][i]
+                
+                for mut_type in ['C>T', 'G>A', 'other']:
+                    count = counts[end][f'{mut_type}_counts'][i]
+                    
+                    frequencies[end][f'{mut_type}_counts'].append(count)
+                    if total > 0:
+                        frequencies[end][mut_type].append(count / total)
+                    else:
+                        frequencies[end][mut_type].append(0)
 
     return frequencies
-
-
-
-
-
-def calculate_double_end_mismatch_frequency(read_lengths):
-    max_distance = 30
-    counts_5p = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
-    counts_3p = {'C>T': [0]*max_distance, 'G>A': [0]*max_distance, 'other': [0]*max_distance}
-    total_bases_5p = [0]*max_distance
-    total_bases_3p = [0]*max_distance
-
-    for read_tuple in read_lengths:
-        read = read_tuple[4]  # Read object
-        sequence = read.query_sequence
-        if sequence is None:
-            continue
-        seq_length = len(sequence)
-
-        if read.is_reverse:
-            orientation = 'reverse'
-            sequence = reverse_complement(sequence)
-        else:
-            orientation = 'forward'
-
-        # Get aligned positions and mismatches
-        aligned_pairs = read.get_aligned_pairs(with_seq=True)
-        for query_pos, ref_pos, ref_base in aligned_pairs:
-            if query_pos is None or ref_pos is None:
-                continue  # Skip insertions and deletions
-            if query_pos >= seq_length:
-                continue
-
-            if orientation == 'reverse':
-                dist_5p = seq_length - query_pos - 1
-                dist_3p = query_pos
-            else:
-                dist_5p = query_pos
-                dist_3p = seq_length - query_pos - 1
-
-            # Process 5' end
-            if dist_5p < max_distance:
-                total_bases_5p[dist_5p] += 1
-                read_base = sequence[query_pos]
-                if read.is_reverse:
-                    ref_base_adj = complement_base(ref_base)
-                    read_base_adj = complement_base(read_base)
-                else:
-                    ref_base_adj = ref_base
-                    read_base_adj = read_base
-
-                if ref_base_adj.upper() != read_base_adj.upper():
-                    key = f"{ref_base_adj.upper()}>{read_base_adj.upper()}"
-                    if key == 'C>T':
-                        counts_5p['C>T'][dist_5p] += 1
-                    elif key == 'G>A':
-                        counts_5p['G>A'][dist_5p] += 1
-                    else:
-                        counts_5p['other'][dist_5p] += 1
-
-            # Process 3' end
-            if dist_3p < max_distance:
-                total_bases_3p[dist_3p] += 1
-                read_base = sequence[query_pos]
-                if read.is_reverse:
-                    ref_base_adj = complement_base(ref_base)
-                    read_base_adj = complement_base(read_base)
-                else:
-                    ref_base_adj = ref_base
-                    read_base_adj = read_base
-
-                if ref_base_adj.upper() != read_base_adj.upper():
-                    key = f"{ref_base_adj.upper()}>{read_base_adj.upper()}"
-                    if key == 'C>T':
-                        counts_3p['C>T'][dist_3p] += 1
-                    elif key == 'G>A':
-                        counts_3p['G>A'][dist_3p] += 1
-                    else:
-                        counts_3p['other'][dist_3p] += 1
-
-    # Calculate frequencies for 5' end
-    frequencies_5p = {}
-    for key in counts_5p:
-        frequencies_5p[key] = [
-            counts_5p[key][i] / total_bases_5p[i] if total_bases_5p[i] > 0 else 0
-            for i in range(max_distance)
-        ]
-
-    # Calculate frequencies for 3' end
-    frequencies_3p = {}
-    for key in counts_3p:
-        frequencies_3p[key] = [
-            counts_3p[key][i] / total_bases_3p[i] if total_bases_3p[i] > 0 else 0
-            for i in range(max_distance)
-        ]
-
-    frequencies = {'5_prime': frequencies_5p, '3_prime': frequencies_3p}
-    return frequencies
-
-
-
 
 
 def create_mismatch_frequency_plot(frequencies, sequencing_type):
@@ -1205,243 +1079,157 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
         )
         return fig
 
-    if sequencing_type == 'single':
-        # Existing plotting code for single-stranded sequencing
-        fig = plot_single_end_mismatch_frequency(frequencies)
-    elif sequencing_type == 'double':
-        # New plotting code for double-stranded sequencing
-        fig = plot_double_end_mismatch_frequency(frequencies)
-    else:
-        fig = go.Figure()
-    return fig
-
-def plot_single_end_mismatch_frequency(frequencies):
     fig = go.Figure()
-    x_values = list(range(len(frequencies['C>T'])))
+    
+    if sequencing_type == 'single':
+        x_values = list(range(len(frequencies['C>T'])))
+        
+        for mut_type, color, symbol in [
+            ('C>T', colors['line'], 'circle'),
+            ('G>A', colors['highlight'], 'square'),
+            ('other', colors['highlight2'], 'diamond')
+        ]:
+            # Calculate confidence intervals
+            lower_bounds, upper_bounds = calculate_confidence_intervals(
+                frequencies[f'{mut_type}_counts'],
+                frequencies['total_bases']
+            )
+            
+            # Main line
+            fig.add_trace(go.Scatter(
+                x=x_values,
+                y=frequencies[mut_type],
+                name=mut_type,
+                mode='lines+markers',
+                line=dict(color=color),
+                marker=dict(symbol=symbol)
+            ))
+            
+            # Confidence interval
+            fig.add_trace(go.Scatter(
+                x=x_values + x_values[::-1],
+                y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
+                fill='toself',
+                fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
+                line=dict(width=0),
+                showlegend=False,
+                name=f'{mut_type} 95% CI'
+            ))
+            
+            # Add sample size indicators
+            sizes = frequencies['total_bases']
+            normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
+            
+            fig.add_trace(go.Scatter(
+                x=x_values,
+                y=frequencies[mut_type],
+                mode='markers',
+                marker=dict(
+                    size=normalized_sizes,
+                    color=color,
+                    symbol=symbol,
+                    line=dict(width=1, color='white')
+                ),
+                showlegend=False
+            ))
+    else:
+        for end, title in [('5_prime', "5' End"), ('3_prime', "3' End")]:
+            for mut_type, color, symbol in [
+                ('C>T', colors['line'], 'circle'),
+                ('G>A', colors['highlight'], 'square'),
+                ('other', colors['highlight2'], 'diamond')
+            ]:
+                name = f"{mut_type} ({title})"
+                x_values = list(range(len(frequencies[end][mut_type])))
+                
+                # Calculate confidence intervals
+                lower_bounds, upper_bounds = calculate_confidence_intervals(
+                    frequencies[end][f'{mut_type}_counts'],
+                    frequencies[end]['total_bases']
+                )
+                
+                # Main line
+                fig.add_trace(go.Scatter(
+                    x=x_values,
+                    y=frequencies[end][mut_type],
+                    name=name,
+                    mode='lines+markers',
+                    line=dict(color=color),
+                    marker=dict(symbol=symbol)
+                ))
+                
+                # Confidence interval
+                fig.add_trace(go.Scatter(
+                    x=x_values + x_values[::-1],
+                    y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
+                    fill='toself',
+                    fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
+                    line=dict(width=0),
+                    showlegend=False,
+                    name=f'{name} 95% CI'
+                ))
+                
+                # Add sample size indicators
+                sizes = frequencies[end]['total_bases']
+                normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
+                
+                fig.add_trace(go.Scatter(
+                    x=x_values,
+                    y=frequencies[end][mut_type],
+                    mode='markers',
+                    marker=dict(
+                        size=normalized_sizes,
+                        color=color,
+                        symbol=symbol,
+                        line=dict(width=1, color='white')
+                    ),
+                    showlegend=False
+                ))
 
-    # Trace for 'C>T' mismatches
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['C>T'],
-        mode='lines+markers',
-        name='C>T',
-        line=dict(color=colors['line'], width=2, dash='solid'),
-        marker=dict(size=6, color=colors['line'], symbol='circle')
-    ))
-
-    # Trace for 'G>A' mismatches
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['G>A'],
-        mode='lines+markers',
-        name='G>A',
-        line=dict(color=colors['highlight'], width=2, dash='dash'),
-        marker=dict(size=6, color=colors['highlight'], symbol='square')
-    ))
-
-    # Trace for 'other' mismatches
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=frequencies['other'],
-        mode='lines+markers',
-        name='Other',
-        line=dict(color=colors['highlight2'], width=2, dash='dot'),
-        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
-    ))
-
-    # Update layout
     fig.update_layout(
-        title=dict(
-            text='Mismatch Frequency (per read) vs Distance from Read End',
-            font=dict(size=20, color=colors['muted']),
-            x=0.5,
-            y=0.95
-        ),
-        xaxis=dict(
-            title='Distance from Read End (bp)',
-            color=colors['muted'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-        ),
-        yaxis=dict(
-            title='Mismatch Frequency',
-            color=colors['primary'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-            rangemode='tozero',
-        ),
-        legend=dict(
-            x=0.85,
-            y=1.15,
-            bgcolor='rgba(0, 0, 0, 0.5)',
-            bordercolor='rgba(255, 255, 255, 0.3)',
-            borderwidth=1,
-            font=dict(color=colors['muted'])
-        ),
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        dragmode='select',
-        selectdirection='h',
-        newselection_line_width=2,
-        newselection_line_color=colors['secondary'],
-        newselection_line_dash='dashdot',
-        margin=dict(t=50, b=50, l=50, r=50)
-    )
-
-    # Update hover templates
-    fig.update_traces(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
-
-    return fig
-
-def plot_double_end_mismatch_frequency(frequencies):
-    # Create subplots with two columns
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("5' End", "3' End"))
-
-    # Frequencies for 5' end
-    x_values_5p = list(range(len(frequencies['5_prime']['C>T'])))
-    # Frequencies for 3' end
-    x_values_3p = list(range(len(frequencies['3_prime']['C>T'])))
-
-    # Plotting for 5' end
-    # Trace for 'C>T' mismatches at 5' end
-    fig.add_trace(go.Scatter(
-        x=x_values_5p,
-        y=frequencies['5_prime']['C>T'],
-        mode='lines+markers',
-        name='C>T (5\')',
-        line=dict(color=colors['line'], width=2, dash='solid'),
-        marker=dict(size=6, color=colors['line'], symbol='circle')
-    ), row=1, col=1)
-
-    # Trace for 'G>A' mismatches at 5' end
-    fig.add_trace(go.Scatter(
-        x=x_values_5p,
-        y=frequencies['5_prime']['G>A'],
-        mode='lines+markers',
-        name='G>A (5\')',
-        line=dict(color=colors['highlight'], width=2, dash='dash'),
-        marker=dict(size=6, color=colors['highlight'], symbol='square')
-    ), row=1, col=1)
-
-    # Trace for 'other' mismatches at 5' end
-    fig.add_trace(go.Scatter(
-        x=x_values_5p,
-        y=frequencies['5_prime']['other'],
-        mode='lines+markers',
-        name='Other (5\')',
-        line=dict(color=colors['highlight2'], width=2, dash='dot'),
-        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
-    ), row=1, col=1)
-
-    # Plotting for 3' end
-    # Trace for 'C>T' mismatches at 3' end
-    fig.add_trace(go.Scatter(
-        x=x_values_3p,
-        y=frequencies['3_prime']['C>T'],
-        mode='lines+markers',
-        name='C>T (3\')',
-        line=dict(color=colors['line'], width=2, dash='solid'),
-        marker=dict(size=6, color=colors['line'], symbol='circle')
-    ), row=1, col=2)
-
-    # Trace for 'G>A' mismatches at 3' end
-    fig.add_trace(go.Scatter(
-        x=x_values_3p,
-        y=frequencies['3_prime']['G>A'],
-        mode='lines+markers',
-        name='G>A (3\')',
-        line=dict(color=colors['highlight'], width=2, dash='dash'),
-        marker=dict(size=6, color=colors['highlight'], symbol='square')
-    ), row=1, col=2)
-
-    # Trace for 'other' mismatches at 3' end
-    fig.add_trace(go.Scatter(
-        x=x_values_3p,
-        y=frequencies['3_prime']['other'],
-        mode='lines+markers',
-        name='Other (3\')',
-        line=dict(color=colors['highlight2'], width=2, dash='dot'),
-        marker=dict(size=6, color=colors['highlight2'], symbol='diamond')
-    ), row=1, col=2)
-
-    # Update layout
-    fig.update_layout(
-        title=dict(
-            text='Mismatch Frequency (per read) vs Distance from Read Ends',
-            font=dict(size=20, color=colors['muted']),
-            x=0.5,
-            y=0.95
-        ),
-        # Update x-axes
-        xaxis=dict(
-            title='Distance from 5\' End (bp)',
-            color=colors['muted'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-        ),
-        xaxis2=dict(
-            title='Distance from 3\' End (bp)',
-            color=colors['muted'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-        ),
-        # Update y-axes
-        yaxis=dict(
-            title='Mismatch Frequency',
-            color=colors['primary'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-            rangemode='tozero',
-        ),
-        yaxis2=dict(
-            title='Mismatch Frequency',
-            color=colors['primary'],
-            tickfont=dict(size=12, color=colors['muted']),
-            gridcolor=colors['grid'],
-            showline=True,
-            linewidth=1,
-            linecolor=colors['primary'],
-            zeroline=False,
-            rangemode='tozero',
-        ),
-        legend=dict(
-            x=1.05,
-            y=1,
-            bgcolor='rgba(0, 0, 0, 0)',
-            bordercolor='rgba(0, 0, 0, 0)',
-            font=dict(color=colors['muted'])
-        ),
+        title='Mismatch Frequency vs Distance from Read End with 95% Confidence Intervals',
+        xaxis_title='Position',
+        yaxis_title='Frequency',
+        template='plotly_dark',
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
         font=dict(color=colors['muted']),
-        margin=dict(t=50, b=50, l=50, r=50)
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="right",
+            x=0.99,
+            bgcolor='rgba(0,0,0,0.5)'
+        )
     )
 
-    # Update hover templates for all traces
+    # Add hover text with sample size information
     for trace in fig.data:
-        trace.update(hovertemplate='Distance: %{x} bp<br>Frequency: %{y:.4f}<extra></extra>')
+        if trace.mode == 'lines+markers':
+            pos = trace.x
+            freq = trace.y
+            if sequencing_type == 'single':
+                n = frequencies['total_bases']
+            else:
+                end = '5_prime' if "5' End" in trace.name else '3_prime'
+                n = frequencies[end]['total_bases']
+            
+            hover_text = [
+                f'Position: {p}<br>'
+                f'Frequency: {f:.4f}<br>'
+                f'Sample size: {s:,}<br>'
+                f'95% CI: [{l:.4f}, {u:.4f}]'
+                for p, f, s, l, u in zip(
+                    pos, freq, n,
+                    lower_bounds, upper_bounds
+                )
+            ]
+            trace.hovertemplate = '%{text}<extra></extra>'
+            trace.text = hover_text
 
     return fig
+
 
 
 def display_mapdamage_results(output_dir):
@@ -2410,7 +2198,6 @@ layout_main = dbc.Container([
                                     dbc.Tab(dcc.Graph(id='cg-content-histogram'), label="CG Distribution"),
                                     dbc.Tab(dcc.Graph(id='damage-patterns'), label="Damage Patterns"),
                                     dbc.Tab(dcc.Graph(id='mismatch-frequency-plot'), label="Mismatch Frequency"),
-                                    dbc.Tab(dcc.Graph(id='mismatch-frequency-plot-old'), label="Mismatch Frequency (old)"),
                                     dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart'), label="Mismatch Types"),
                                     dbc.Tab(dcc.Graph(id='damage-pattern-plot'), label="Damage Patterns Along Reads"),
                                     dbc.Tab(dcc.Graph(id='mapq-histogram'), label="MAPQ Distribution"),
@@ -3600,7 +3387,6 @@ def update_file_store(contents, filenames, store_data, current_selection):
         Output('damage-patterns', 'figure'),
         Output('selected-lengths', 'data'),
         Output('mismatch-frequency-plot', 'figure'),
-        Output('mismatch-frequency-plot-old', 'figure'),
         Output('data-summary', 'children'),
         Output('mapq-histogram', 'figure'),
         Output('mismatch-type-bar-chart', 'figure'),
@@ -3647,8 +3433,9 @@ def update_histograms(
         empty_text = ""
         return (
             empty_figure, empty_figure, empty_figure, empty_figure, [],
-            empty_figure, empty_figure, empty_text, empty_figure, empty_figure, empty_figure
+            empty_figure, empty_text, empty_figure, empty_figure, empty_figure
         )
+
 
     # Initialize selected_lengths
     selected_lengths = []
@@ -3722,11 +3509,8 @@ def update_histograms(
     # Handle mismatch frequency based on file format
     if file_format in ['bam', 'sam']:
         frequencies = calculate_mismatch_frequency(read_lengths, file_format, sequencing_type)
-        frequencies_old = calculate_mismatch_frequency_old(read_lengths, file_format)
         if frequencies:
             mismatch_freq_fig = create_mismatch_frequency_plot(frequencies, sequencing_type)
-        if frequencies_old:
-            old_mismatch_freq_fig = create_mismatch_frequency_plot_old(frequencies_old)
     else:
         frequencies = None
         frequencies_old = None
@@ -3827,7 +3611,7 @@ def update_histograms(
     # Return updated figures and data
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
-        selected_lengths, mismatch_freq_fig, old_mismatch_freq_fig, data_summary_text, mapq_fig,
+        selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
         mismatch_type_fig, damage_pattern_fig
     )
 
