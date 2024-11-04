@@ -38,9 +38,10 @@ import threading
 import queue
 import time
 import datetime
+import requests
 
 
-from utils.tasks import celery_app, run_mapdamage_task, run_centrifuge_task
+from utils.tasks import celery_app, run_mapdamage_task, run_centrifuge_task, load_bam_file
 from pages import simulation
 from utils.files import TempDirectoryManager
 
@@ -2835,6 +2836,17 @@ layout_main = dbc.Container([
                 ])
             ], className="mb-4"),
 
+            # Progress Tracking Section
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4("Loading Progress", className="card-title mb-4"),
+                    dcc.Store(id='task-id'),
+                    dbc.Progress(id='progress-bar', value=0, max=100, style={'height': '30px'}),
+                    html.Div(id='progress-percentage', className="mt-2"),
+                    dcc.Interval(id='interval-component', interval=1000, n_intervals=0), 
+                ])
+            ], className="mb-4"),
+
             # Analysis Results Section
             dbc.Card([
                 dbc.CardBody([
@@ -4326,6 +4338,49 @@ def update_file_store(contents, filenames, store_data, current_selection):
 
 
 
+###########################################################################################################
+
+###########################################################################################################
+
+# Trigger BAM load task with a button click
+@app.callback(
+    Output('loading-status', 'children'),
+    Input('load-bam-button', 'n_clicks'),
+    State('uploaded-bam-file', 'data'),
+    prevent_initial_call=True
+)
+def load_bam_file_trigger(n_clicks, uploaded_file_data):
+    if not uploaded_file_data:
+        raise PreventUpdate
+
+    # Assume uploaded_file_data contains a path to the uploaded BAM file
+    task = load_bam_file.apply_async(args=[uploaded_file_data])
+    return html.Div(f"Task ID: {task.id}")
+
+@app.callback(
+    Output('progress-bar', 'value'),
+    Output('progress-percentage', 'children'),
+    Input('interval-component', 'n_intervals'),
+    State('task-id', 'data'),
+    prevent_initial_call=True
+)
+def update_progress(n_intervals, task_id):
+    if not task_id:
+        raise PreventUpdate
+
+    response = requests.get(f'http://localhost:5555/api/task/{task_id}')
+    task_status = response.json()
+    if task_status['state'] == 'PROGRESS':
+        progress = task_status['meta']['progress']
+        return progress, f"{progress:.2f}%"
+    elif task_status['state'] == 'SUCCESS':
+        return 100, "100% (Complete)"
+    elif task_status['state'] == 'FAILURE':
+        return 0, "Task Failed"
+    else:
+        return dash.no_update, dash.no_update
+
+
 @app.callback(
     [
         Output('read-length-histogram', 'figure'),
@@ -4690,7 +4745,7 @@ if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         worker_process = subprocess.Popen(
             [
-                sys.executable, '-m', 'celery', '-A', 'tasks.celery_app', 'worker',
+                sys.executable, '-m', 'celery', '-A', 'utils.tasks.celery_app', 'worker',
                 '--loglevel=info'
             ],
             stdout=subprocess.PIPE,
