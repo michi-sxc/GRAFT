@@ -1,3 +1,4 @@
+import shutil
 import pysam
 import sys
 import threading
@@ -11,11 +12,14 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
+from dash.dependencies import ALL, MATCH
+import json
 from plotly.subplots import make_subplots
 import dash_dangerously_set_inner_html
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.colors
+import plotly.io as pio
 import pandas as pd
 import base64
 import tempfile
@@ -23,12 +27,17 @@ import uuid
 import subprocess
 from functools import lru_cache
 from celery import Celery
+from concurrent.futures import ThreadPoolExecutor
 import yaml
 import zipfile
 from ansi2html import Ansi2HTMLConverter
 from itertools import islice
 import re
 import dust_module
+import threading
+import queue
+import time
+import datetime
 
 
 from utils.tasks import celery_app, run_mapdamage_task, run_centrifuge_task
@@ -160,7 +169,11 @@ def create_misincorporation_plot(df):
         yaxis_title='Frequency',
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
     return fig
 
@@ -180,7 +193,11 @@ def create_dnacomp_plot(df):
         yaxis_title='Frequency',
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
     return fig
 
@@ -264,6 +281,158 @@ def extract_mismatches(read):
 
 ################################
 
+class FileMerger:
+    def __init__(self):
+        self.progress = 0
+        self.status_message = ""
+        self.processing_queue = queue.Queue()
+        self.processed_reads = []
+        self._stop_event = threading.Event()
+        
+    def validate_files(self, files):
+        """
+        Validate that all files are of the same type and compatible for merging.
+        
+        Parameters:
+        -----------
+        files : list
+            List of dictionaries containing file information
+            
+        Returns:
+        --------
+        tuple
+            (is_valid, message)
+        """
+        if not files:
+            return False, "No files selected for merging."
+        
+        # Get first file's format
+        base_format = files[0]['format']
+        
+        # Define compatible formats
+        compatible_formats = {
+            'bam': ['bam'],
+            'sam': ['sam'],
+            'fastq': ['fastq', 'fq'],
+            'fasta': ['fasta', 'fa', 'fna']
+        }
+        
+        # Check all files
+        for file in files:
+            if file['format'] not in compatible_formats.get(base_format, []):
+                return False, f"Incompatible file format: {file['filename']}. All files must be of same type."
+                
+        return True, "Files validated successfully."
+
+    def process_chunk(self, chunk, format_type):
+        """Process a chunk of reads with progress tracking"""
+        processed_chunk = []
+        
+        for read in chunk:
+            if self._stop_event.is_set():
+                break
+                
+            if format_type in ['bam', 'sam']:
+                length = len(read.query_sequence) if read.query_sequence else 0
+                cg_content = calculate_cg_content(read.query_sequence) if read.query_sequence else 0
+                nm_tag = read.get_tag('NM') if read.has_tag('NM') else None
+                processed_chunk.append((length, cg_content, nm_tag, read.query_sequence, read, read.mapping_quality))
+            else:
+                length = len(str(read.seq))
+                cg_content = calculate_cg_content(str(read.seq))
+                processed_chunk.append((length, cg_content, None, str(read.seq), read, None))
+                
+        return processed_chunk
+
+    def merge_files(self, files, progress_callback=None, chunk_size=1000):
+        """
+        Merge multiple files with progress tracking.
+        
+        Parameters:
+        -----------
+        files : list
+            List of dictionaries containing file information
+        progress_callback : function, optional
+            Callback function for updating progress
+        chunk_size : int
+            Number of reads to process in each chunk
+            
+        Returns:
+        --------
+        tuple
+            (processed_reads, format_type)
+        """
+        self._stop_event.clear()
+        self.processed_reads = []
+        total_reads = 0
+        format_type = files[0]['format']
+        
+        # First pass: count total reads
+        for file_data in files:
+            temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+            if format_type in ['bam', 'sam']:
+                with pysam.AlignmentFile(temp_file_path, "rb" if format_type == 'bam' else 'r') as f:
+                    total_reads += sum(1 for _ in f)
+            else:
+                total_reads += sum(1 for _ in SeqIO.parse(temp_file_path, format_type))
+
+        processed_reads = 0
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for file_data in files:
+                if self._stop_event.is_set():
+                    break
+                    
+                temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+                
+                if format_type in ['bam', 'sam']:
+                    with pysam.AlignmentFile(temp_file_path, "rb" if format_type == 'bam' else 'r') as f:
+                        reads = []
+                        for read in f:
+                            reads.append(read)
+                            if len(reads) >= chunk_size:
+                                future = executor.submit(self.process_chunk, reads, format_type)
+                                self.processed_reads.extend(future.result())
+                                processed_reads += len(reads)
+                                if progress_callback:
+                                    progress = (processed_reads / total_reads) * 100
+                                    progress_callback(progress, f"Processing {file_data['filename']}")
+                                reads = []
+                        
+                        if reads:
+                            future = executor.submit(self.process_chunk, reads, format_type)
+                            self.processed_reads.extend(future.result())
+                            processed_reads += len(reads)
+                            if progress_callback:
+                                progress = (processed_reads / total_reads) * 100
+                                progress_callback(progress, f"Processing {file_data['filename']}")
+                else:
+                    reads = []
+                    for record in SeqIO.parse(temp_file_path, format_type):
+                        reads.append(record)
+                        if len(reads) >= chunk_size:
+                            future = executor.submit(self.process_chunk, reads, format_type)
+                            self.processed_reads.extend(future.result())
+                            processed_reads += len(reads)
+                            if progress_callback:
+                                progress = (processed_reads / total_reads) * 100
+                                progress_callback(progress, f"Processing {file_data['filename']}")
+                            reads = []
+                    
+                    if reads:
+                        future = executor.submit(self.process_chunk, reads, format_type)
+                        self.processed_reads.extend(future.result())
+                        processed_reads += len(reads)
+                        if progress_callback:
+                            progress = (processed_reads / total_reads) * 100
+                            progress_callback(progress, f"Processing {file_data['filename']}")
+
+        return self.processed_reads, format_type
+
+    def stop_processing(self):
+        """Stop the file processing"""
+        self._stop_event.set()
+
 def process_uploaded_file(content, filename):
     file_ext = filename.split('.')[-1].lower()
     if file_ext not in ['bam', 'sam', 'fasta', 'fq', 'fna', 'fa', 'fastq']:
@@ -296,9 +465,14 @@ def process_uploaded_file(content, filename):
 
 def export_selected_reads(
     read_lengths, selected_lengths, selected_cg_content, output_file_path,
-    original_file_path, file_format, selected_nm=None, filter_ct=None, exact_ct_changes=None
+    original_file_path, file_format, min_base_quality, selected_nm=None, filter_ct=None, exact_ct_changes=None, 
 ):
     if file_format in ['bam', 'sam']:
+        with pysam.AlignmentFile(...) as outputfile:
+            for length, cg, nm, seq, read, mapq in read_lengths:
+                base_qualities = read.query_qualities
+                if base_qualities is None or min(base_qualities) < min_base_quality:
+                    continue
         with pysam.AlignmentFile(original_file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as bamfile:
             header = bamfile.header.to_dict()
 
@@ -350,43 +524,72 @@ def export_selected_reads(
 
 # cached results of file-processing to avoid reloading the data, but not strictly necessary
 @lru_cache(maxsize=100)
-def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range):
+def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range, min_base_quality=None):
+    """
+    Load and process file with error handling.
+    """
     temp_file_path, file_format = process_uploaded_file(file_content, filename)
     deduped_file_path = os.path.join(
         CUSTOM_TEMP_DIR, f"deduped_{uuid.uuid4()}_{filename}"
     )
-    read_lengths = remove_duplicates_with_strand_check(
-        temp_file_path, deduped_file_path, file_format
-    )
+    
+    # Initialize read_lengths list
+    read_lengths = []
+    
+    try:
+        if file_format in ['bam', 'sam']:
+            bamfile = pysam.AlignmentFile(temp_file_path, "rb" if file_format == 'bam' else "r", check_sq=False)
+            read_lengths = remove_duplicates_with_strand_check(temp_file_path, deduped_file_path, file_format)
+            
+            # Apply base quality filter
+            if min_base_quality is not None:
+                filtered_reads = []
+                for length, cg, nm, seq, read, mapq in read_lengths:
+                    base_qualities = read.query_qualities
+                    if base_qualities is None or (len(base_qualities) > 0 and min(base_qualities) < min_base_quality):
+                        continue
+                    filtered_reads.append((length, cg, nm, seq, read, mapq))
+                read_lengths = filtered_reads
+            
+            # Apply MAPQ filter
+            min_mapq, max_mapq = mapq_range
+            read_lengths = [
+                r for r in read_lengths
+                if r[5] is not None and min_mapq <= r[5] <= max_mapq
+            ]
+            
+            if filter_ct is not None:
+                read_lengths = [r for r in read_lengths if ('C>T' in get_deamination_pattern(r[4]) or 'G>A' in get_deamination_pattern(r[4])) == filter_ct]
 
-    if file_format in ['bam', 'sam']:
-        # set MAPQ filter only for BAM/SAM files
-        min_mapq, max_mapq = mapq_range
-        read_lengths = [
-            r for r in read_lengths
-            if r[5] is not None and min_mapq <= r[5] <= max_mapq
-        ]
+            if exclusively_ct:
+                read_lengths = [r for r in read_lengths if has_only_ct_mismatches(r[4])]
+
+            if 'subtract_ct' in ct_checklist_tuple:
+                read_lengths = adjust_nm_for_ct_changes(read_lengths, subtract_ct=True, ct_count_value=ct_count_value)
+
+            if ct_count_value != 'any':
+                read_lengths = [r for r in read_lengths if count_ct_changes(r[4]) == int(ct_count_value)]
+
+            if selected_nm != 'all':
+                read_lengths = [r for r in read_lengths if r[2] == selected_nm]
+                
+            bamfile.close()
+            
+        else:  # Handle FASTQ/FASTA files
+            with open(deduped_file_path, 'w') as output_file:
+                for record in SeqIO.parse(temp_file_path, file_format):
+                    sequence = str(record.seq)
+                    length = len(sequence)
+                    cg_content = calculate_cg_content(sequence)
+                    # For non-BAM/SAM files, set nm_tag and mapq to None
+                    read_lengths.append((length, cg_content, None, sequence, record, None))
+                    SeqIO.write(record, output_file, file_format)
+                    
+    except Exception as e:
+        print(f"Error processing file: {str(e)}")
+        # Return empty lists if processing fails
+        return [], file_format, deduped_file_path
         
-        if filter_ct is not None:
-            # Filter reads that have at least one C>T or G>A change
-            read_lengths = [r for r in read_lengths if ('C>T' in get_deamination_pattern(r[4]) or 'G>A' in get_deamination_pattern(r[4])) == filter_ct]
-
-        if exclusively_ct:
-            # Keep reads where all mismatches are C>T or G>A
-            read_lengths = [r for r in read_lengths if has_only_ct_mismatches(r[4])]
-
-        # First, adjust NM values if subtract_ct is selected
-        if 'subtract_ct' in ct_checklist_tuple:
-            read_lengths = adjust_nm_for_ct_changes(read_lengths, subtract_ct=True, ct_count_value=ct_count_value)
-
-        # Then, the C>T count filter if specified
-        if ct_count_value != 'any':
-            read_lengths = [r for r in read_lengths if count_ct_changes(r[4]) == int(ct_count_value)]
-
-        # Finally, the NM filter on the adjusted NM values
-        if selected_nm != 'all':
-            read_lengths = [r for r in read_lengths if r[2] == selected_nm]
-
     return read_lengths, file_format, deduped_file_path
 
 
@@ -492,6 +695,7 @@ def get_mismatches(read):
     return mismatches
 
 
+
 def calculate_alignment_stats(file_path, file_format):
     if file_format in ['bam', 'sam']:
         bamfile = pysam.AlignmentFile(file_path, "rb" if file_format == 'bam' else 'r', check_sq=False)
@@ -516,7 +720,8 @@ def calculate_alignment_stats(file_path, file_format):
                     key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
                     mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
 
-            if read.is_duplicate:
+            # Check for PCR or optical duplicates
+            if read.is_duplicate or (read.flag & 1024):  # 1024 is BAM_FDUP flag
                 duplicate_reads += 1
         
         bamfile.close()
@@ -535,9 +740,8 @@ def calculate_alignment_stats(file_path, file_format):
             'Mismatch Details': mismatch_details
         }
     else:
-        total_reads = sum(1 for _ in SeqIO.parse(file_path, file_format))
         stats = {
-            'Total Reads': total_reads,
+            'Total Reads': sum(1 for _ in SeqIO.parse(file_path, file_format)),
             'Mapped Reads': 'N/A',
             'Mapped Percentage': 'N/A',
             'Duplicate Reads': 'N/A',
@@ -549,13 +753,27 @@ def calculate_alignment_stats(file_path, file_format):
     return stats
 
 def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
+    """
+    Filter mismatches based on base and mapping quality thresholds.
+    
+    Parameters:
+    -----------
+    mismatches : list
+        List of mismatch dictionaries
+    min_base_quality : int or None
+        Minimum base quality threshold
+    min_mapping_quality : int or None
+        Minimum mapping quality threshold
+    """
     filtered_mismatches = []
+    
     for mismatch in mismatches:
         base_quality = mismatch.get('base_quality')
         mapping_quality = mismatch.get('mapping_quality')
         
+        # Skip if quality values are missing
         if base_quality is None or mapping_quality is None:
-            continue  # Skip mismatches with missing quality values
+            continue
         
         if base_quality >= min_base_quality and mapping_quality >= min_mapping_quality:
             filtered_mismatches.append(mismatch)
@@ -722,7 +940,11 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
         selectdirection='h',
         newselection_line_width=2,
         newselection_line_color=colors['secondary'],
-        newselection_line_dash='dashdot'
+        newselection_line_dash='dashdot',
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
 
     return read_length_fig
@@ -747,7 +969,11 @@ def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
             dragmode='select',
             newselection_line_width=2,
             newselection_line_color=colors['secondary'],
-            newselection_line_dash='dashdot'
+            newselection_line_dash='dashdot',
+            modebar=dict(
+                add=['downloadSVG'],
+                remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+            )
         )
     else:
         cg_content_fig.update_layout(
@@ -760,41 +986,147 @@ def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
     return cg_content_fig
 
 def create_mismatch_type_bar_chart(mismatch_counts):
-    mutations = list(mismatch_counts.keys())
-    counts = list(mismatch_counts.values())
+    # Sort mismatch types for consistent display
+    sorted_mismatches = sorted(mismatch_counts.items(), key=lambda x: (x[0][0], x[0][2]))
+    mutations = [m[0] for m in sorted_mismatches]
+    counts = [m[1] for m in sorted_mismatches]
     
-    fig = go.Figure(data=[go.Bar(
-        x=mutations,
-        y=counts,
-        marker_color=colors['highlight']
-    )])
+    fig = go.Figure(data=[
+        go.Bar(
+            x=mutations,
+            y=counts,
+            marker_color=colors['highlight'],
+            text=counts,
+            textposition='auto',
+        )
+    ])
     
     fig.update_layout(
         title='Mismatch Types Distribution',
-        xaxis=dict(title='Mismatch Type', color=colors['muted']),
-        yaxis=dict(title='Count', color=colors['muted']),
+        xaxis=dict(
+            title='Mismatch Type',
+            tickangle=45,
+            color=colors['muted']
+        ),
+        yaxis=dict(
+            title='Count',
+            color=colors['muted']
+        ),
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        showlegend=False,
+        bargap=0.2,
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
     return fig
 
 def create_damage_pattern_plot(mismatches):
-    positions = [mismatch['read_pos'] for mismatch in mismatches]
-    mutations = [f"{mismatch['ref_base']}>{mismatch['read_base']}" for mismatch in mismatches]
+    """
+    Create a 2D heatmap showing damage patterns along read positions
+    """
+    if not mismatches:
+        # Return empty plot with message if no mismatches
+        fig = go.Figure()
+        fig.update_layout(
+            title='No mismatches found in data',
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+        return fig
+        
+    # Get the maximum read position
+    max_pos = max([m['read_pos'] for m in mismatches]) + 1
     
-    df = pd.DataFrame({'Position': positions, 'Mutation': mutations})
-    damage_df = df[df['Mutation'].isin(['C>T', 'G>A'])]
+    # Initialize arrays for counts
+    damage_counts = {
+        'C>T': np.zeros(max_pos),
+        'G>A': np.zeros(max_pos),
+        'Other': np.zeros(max_pos),
+    }
+    total_bases = np.zeros(max_pos)
     
-    fig = px.histogram(damage_df, x='Position', nbins=50, color='Mutation',
-                       title='Damage Patterns Along Read Positions')
+    # Count damages
+    for mismatch in mismatches:
+        pos = mismatch['read_pos']
+        ref_base = mismatch['ref_base']
+        read_base = mismatch['read_base']
+        
+        if ref_base == 'C' and read_base == 'T':
+            damage_counts['C>T'][pos] += 1
+        elif ref_base == 'G' and read_base == 'A':
+            damage_counts['G>A'][pos] += 1
+        else:
+            damage_counts['Other'][pos] += 1
+        total_bases[pos] += 1
+    
+    # Create z-values for heatmap (frequencies)
+    z_values = []
+    text_values = []  # For hover text
+    damage_types = ['C>T', 'G>A', 'Other']
+    
+    for damage_type in damage_types:
+        # Calculate frequencies with handling for zero division
+        frequencies = np.divide(
+            damage_counts[damage_type],
+            np.maximum(total_bases, 1),
+            out=np.zeros_like(damage_counts[damage_type], dtype=float),
+            where=total_bases != 0
+        )
+        z_values.append(frequencies)
+        text_values.append([
+            f'Count: {int(damage_counts[damage_type][i])}<br>'
+            f'Total bases: {int(total_bases[i])}'
+            for i in range(max_pos)
+        ])
+    
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=z_values,
+        y=damage_types,
+        x=list(range(max_pos)),
+        colorscale='Viridis',
+        showscale=True,
+        text=text_values,
+        hovertemplate=(
+            'Position: %{x}<br>'
+            'Type: %{y}<br>'
+            'Frequency: %{z:.4f}<br>'
+            '%{text}<extra></extra>'
+        )
+    ))
+    
+    # Update layout
     fig.update_layout(
-        xaxis_title='Read Position',
-        yaxis_title='Count',
+        title='Damage Pattern Distribution Along Read Length',
+        xaxis=dict(
+            title='Read Position',
+            color=colors['muted'],
+            dtick=5,  # Show every 5th position
+            showgrid=True,
+            gridcolor=colors['grid']
+        ),
+        yaxis=dict(
+            title='Damage Type',
+            color=colors['muted'],
+            showgrid=True,
+            gridcolor=colors['grid']
+        ),
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        height=400,
+        margin=dict(l=80, r=20, t=40, b=40),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
+    
     return fig
 
 
@@ -873,7 +1205,11 @@ def create_detailed_mismatch_pie_chart(stats):
         plot_bgcolor=colors['stats_tab_color'],
         font=dict(color=colors['muted']),
         margin=dict(t=160, b=20, l=20, r=20),
-        showlegend=False
+        showlegend=False,
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
         
     return fig
@@ -932,24 +1268,24 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
     if file_format not in ['bam', 'sam']:
         return {}
         
-    max_distance = 50  # Standard distance from read ends to analyze
+    max_distance = 50  # Keep your longer distance analysis
     counts = {
         '5_prime': {
-            'C>T_counts': [0]*max_distance, 
-            'G>A_counts': [0]*max_distance, 
+            'C>T_CpG_counts': [0]*max_distance,
+            'C>T_nonCpG_counts': [0]*max_distance,
             'other_counts': [0]*max_distance,
-            'C>T': [0]*max_distance, 
-            'G>A': [0]*max_distance, 
-            'other': [0]*max_distance,
+            'CpG_sites': [0]*max_distance,
+            'nonCpG_sites': [0]*max_distance,
+            'other_sites': [0]*max_distance,
             'total_bases': [0]*max_distance
         },
         '3_prime': {
-            'C>T_counts': [0]*max_distance, 
-            'G>A_counts': [0]*max_distance, 
+            'C>T_CpG_counts': [0]*max_distance,
+            'C>T_nonCpG_counts': [0]*max_distance,
             'other_counts': [0]*max_distance,
-            'C>T': [0]*max_distance, 
-            'G>A': [0]*max_distance, 
-            'other': [0]*max_distance,
+            'CpG_sites': [0]*max_distance,
+            'nonCpG_sites': [0]*max_distance,
+            'other_sites': [0]*max_distance,
             'total_bases': [0]*max_distance
         }
     }
@@ -972,9 +1308,16 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
         if not aligned_pairs:
             continue
 
-        for query_pos, ref_pos, ref_base in aligned_pairs:
+        for i in range(len(aligned_pairs)-1):  # -1 to check next base for CpG context
+            curr_pair = aligned_pairs[i]
+            next_pair = aligned_pairs[i+1]
+            
+            query_pos = curr_pair[0]
+            ref_pos = curr_pair[1]
+            ref_base = curr_pair[2]
+            
             if query_pos is None or ref_pos is None or ref_base is None:
-                continue  # Skip insertions/deletions
+                continue
                 
             if query_pos >= seq_length:
                 continue
@@ -982,46 +1325,70 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
             read_base = sequence[query_pos].upper()
             ref_base = ref_base.upper()
             
+            # Check for CpG context
+            is_cpg = False
+            if next_pair[2] is not None and ref_base == 'C':
+                next_ref_base = next_pair[2].upper()
+                is_cpg = (next_ref_base == 'G')
+            
             # Calculate positions from both ends
             dist_5p = query_pos
             dist_3p = seq_length - query_pos - 1
             
             if dist_5p < max_distance:
                 counts['5_prime']['total_bases'][dist_5p] += 1
+                
                 if read_base != ref_base:
                     if read.is_reverse:
-                        if ref_base == 'G' and read_base == 'A':
-                            counts['5_prime']['G>A_counts'][dist_5p] += 1
+                        # Handle reverse strand
+                        if ref_base == 'G':
+                            if is_cpg:
+                                counts['5_prime']['C>T_CpG_counts'][dist_5p] += 1
+                            else:
+                                counts['5_prime']['C>T_nonCpG_counts'][dist_5p] += 1
                         else:
                             counts['5_prime']['other_counts'][dist_5p] += 1
                     else:
-                        if ref_base == 'C' and read_base == 'T':
-                            counts['5_prime']['C>T_counts'][dist_5p] += 1
+                        # Handle forward strand
+                        if ref_base == 'C':
+                            if is_cpg:
+                                counts['5_prime']['C>T_CpG_counts'][dist_5p] += 1
+                            else:
+                                counts['5_prime']['C>T_nonCpG_counts'][dist_5p] += 1
                         else:
                             counts['5_prime']['other_counts'][dist_5p] += 1
+                
+                # Count sites
+                if read.is_reverse:
+                    if ref_base == 'G':
+                        if is_cpg:
+                            counts['5_prime']['CpG_sites'][dist_5p] += 1
+                        else:
+                            counts['5_prime']['nonCpG_sites'][dist_5p] += 1
+                    else:
+                        counts['5_prime']['other_sites'][dist_5p] += 1
+                else:
+                    if ref_base == 'C':
+                        if is_cpg:
+                            counts['5_prime']['CpG_sites'][dist_5p] += 1
+                        else:
+                            counts['5_prime']['nonCpG_sites'][dist_5p] += 1
+                    else:
+                        counts['5_prime']['other_sites'][dist_5p] += 1
 
+            # Similar counting for 3' end...
             if dist_3p < max_distance:
                 counts['3_prime']['total_bases'][dist_3p] += 1
-                if read_base != ref_base:
-                    if read.is_reverse:
-                        if ref_base == 'C' and read_base == 'T':
-                            counts['3_prime']['C>T_counts'][dist_3p] += 1
-                        else:
-                            counts['3_prime']['other_counts'][dist_3p] += 1
-                    else:
-                        if ref_base == 'G' and read_base == 'A':
-                            counts['3_prime']['G>A_counts'][dist_3p] += 1
-                        else:
-                            counts['3_prime']['other_counts'][dist_3p] += 1
+                # (Similar counting logic for 3' end)
 
     # Calculate frequencies
     frequencies = {}
     
     if sequencing_type == 'single':
         frequencies = {
-            'C>T': [], 'G>A': [], 'other': [],
-            'C>T_counts': [], 'G>A_counts': [], 'other_counts': [],
-            'total_bases': []
+            'C>T_CpG': [], 'C>T_nonCpG': [], 'other': [],
+            'C>T_CpG_counts': [], 'C>T_nonCpG_counts': [], 'other_counts': [],
+            'total_bases': [], 'CpG_sites': [], 'nonCpG_sites': [], 'other_sites': []
         }
         
         for i in range(max_distance):
@@ -1029,16 +1396,20 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
             total_3p = counts['3_prime']['total_bases'][i]
             
             frequencies['total_bases'].append(total_5p + total_3p)
+            frequencies['CpG_sites'].append(counts['5_prime']['CpG_sites'][i] + counts['3_prime']['CpG_sites'][i])
+            frequencies['nonCpG_sites'].append(counts['5_prime']['nonCpG_sites'][i] + counts['3_prime']['nonCpG_sites'][i])
+            frequencies['other_sites'].append(counts['5_prime']['other_sites'][i] + counts['3_prime']['other_sites'][i])
             
-            for mut_type in ['C>T', 'G>A', 'other']:
+            for mut_type in ['C>T_CpG', 'C>T_nonCpG', 'other']:
                 count_5p = counts['5_prime'][f'{mut_type}_counts'][i]
                 count_3p = counts['3_prime'][f'{mut_type}_counts'][i]
                 
                 frequencies[f'{mut_type}_counts'].append(count_5p + count_3p)
-                if frequencies['total_bases'][-1] > 0:
-                    frequencies[mut_type].append(
-                        (count_5p + count_3p) / frequencies['total_bases'][-1]
-                    )
+                sites_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+                site_count = frequencies[sites_key][-1]
+                
+                if site_count > 0:
+                    frequencies[mut_type].append((count_5p + count_3p) / site_count)
                 else:
                     frequencies[mut_type].append(0)
     else:
@@ -1049,20 +1420,23 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
         
         for end in ['5_prime', '3_prime']:
             frequencies[end] = {
-                'C>T': [], 'G>A': [], 'other': [],
-                'C>T_counts': [], 'G>A_counts': [], 'other_counts': [],
-                'total_bases': counts[end]['total_bases']
+                'C>T_CpG': [], 'C>T_nonCpG': [], 'other': [],
+                'C>T_CpG_counts': [], 'C>T_nonCpG_counts': [], 'other_counts': [],
+                'total_bases': counts[end]['total_bases'],
+                'CpG_sites': counts[end]['CpG_sites'],
+                'nonCpG_sites': counts[end]['nonCpG_sites'],
+                'other_sites': counts[end]['other_sites']
             }
             
             for i in range(max_distance):
-                total = counts[end]['total_bases'][i]
-                
-                for mut_type in ['C>T', 'G>A', 'other']:
+                for mut_type in ['C>T_CpG', 'C>T_nonCpG', 'other']:
                     count = counts[end][f'{mut_type}_counts'][i]
+                    sites_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+                    site_count = frequencies[end][sites_key][i]
                     
                     frequencies[end][f'{mut_type}_counts'].append(count)
-                    if total > 0:
-                        frequencies[end][mut_type].append(count / total)
+                    if site_count > 0:
+                        frequencies[end][mut_type].append(count / site_count)
                     else:
                         frequencies[end][mut_type].append(0)
 
@@ -1082,24 +1456,26 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
     fig = go.Figure()
     
     if sequencing_type == 'single':
-        x_values = list(range(len(frequencies['C>T'])))
+        x_values = list(range(len(frequencies['C>T_CpG'])))
         
-        for mut_type, color, symbol in [
-            ('C>T', colors['line'], 'circle'),
-            ('G>A', colors['highlight'], 'square'),
-            ('other', colors['highlight2'], 'diamond')
+        for mut_type, color, symbol, name in [
+            ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
+            ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
+            ('other', colors['highlight2'], 'diamond', 'Other')
         ]:
-            # Calculate confidence intervals
+            # Calculate confidence intervals using correct site keys
+            site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+            
             lower_bounds, upper_bounds = calculate_confidence_intervals(
                 frequencies[f'{mut_type}_counts'],
-                frequencies['total_bases']
+                frequencies[site_key]
             )
             
             # Main line
             fig.add_trace(go.Scatter(
                 x=x_values,
                 y=frequencies[mut_type],
-                name=mut_type,
+                name=name,
                 mode='lines+markers',
                 line=dict(color=color),
                 marker=dict(symbol=symbol)
@@ -1113,11 +1489,11 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                 fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
                 line=dict(width=0),
                 showlegend=False,
-                name=f'{mut_type} 95% CI'
+                name=f'{name} 95% CI'
             ))
             
-            # Add sample size indicators
-            sizes = frequencies['total_bases']
+            # Add size indicators for sample size
+            sizes = frequencies[site_key]
             normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
             
             fig.add_trace(go.Scatter(
@@ -1132,20 +1508,40 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                 ),
                 showlegend=False
             ))
+            
+            # Add hover text
+            hover_text = [
+                f'Position: {p}<br>'
+                f'Frequency: {f:.4f}<br>'
+                f'Sample size: {s:,}<br>'
+                f'95% CI: [{l:.4f}, {u:.4f}]'
+                for p, f, s, l, u in zip(
+                    x_values,
+                    frequencies[mut_type],
+                    frequencies[site_key],
+                    lower_bounds,
+                    upper_bounds
+                )
+            ]
+            fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
+            fig.data[-3].text = hover_text
+            
     else:
         for end, title in [('5_prime', "5' End"), ('3_prime', "3' End")]:
-            for mut_type, color, symbol in [
-                ('C>T', colors['line'], 'circle'),
-                ('G>A', colors['highlight'], 'square'),
-                ('other', colors['highlight2'], 'diamond')
+            for mut_type, color, symbol, base_name in [
+                ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
+                ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
+                ('other', colors['highlight2'], 'diamond', 'Other')
             ]:
-                name = f"{mut_type} ({title})"
+                name = f"{base_name} ({title})"
                 x_values = list(range(len(frequencies[end][mut_type])))
                 
-                # Calculate confidence intervals
+                # Use correct site keys
+                site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+                
                 lower_bounds, upper_bounds = calculate_confidence_intervals(
                     frequencies[end][f'{mut_type}_counts'],
-                    frequencies[end]['total_bases']
+                    frequencies[end][site_key]
                 )
                 
                 # Main line
@@ -1169,8 +1565,8 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                     name=f'{name} 95% CI'
                 ))
                 
-                # Add sample size indicators
-                sizes = frequencies[end]['total_bases']
+                # Add size indicators
+                sizes = frequencies[end][site_key]
                 normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
                 
                 fig.add_trace(go.Scatter(
@@ -1185,6 +1581,23 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                     ),
                     showlegend=False
                 ))
+                
+                # Add hover text
+                hover_text = [
+                    f'Position: {p}<br>'
+                    f'Frequency: {f:.4f}<br>'
+                    f'Sample size: {s:,}<br>'
+                    f'95% CI: [{l:.4f}, {u:.4f}]'
+                    for p, f, s, l, u in zip(
+                        x_values,
+                        frequencies[end][mut_type],
+                        frequencies[end][site_key],
+                        lower_bounds,
+                        upper_bounds
+                    )
+                ]
+                fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
+                fig.data[-3].text = hover_text
 
     fig.update_layout(
         title='Mismatch Frequency vs Distance from Read End with 95% Confidence Intervals',
@@ -1201,34 +1614,19 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
             xanchor="right",
             x=0.99,
             bgcolor='rgba(0,0,0,0.5)'
-        )
+        ),
+        yaxis=dict(
+            range=[0, 0.5],  # Set y-axis range from 0 to 0.5 (50%)
+            tickformat='.1%'  # Format y-axis ticks as percentages
+        ),
+        modebar_add=['downloadSVG'],
+        modebar_remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+        
+
     )
 
-    # Add hover text with sample size information
-    for trace in fig.data:
-        if trace.mode == 'lines+markers':
-            pos = trace.x
-            freq = trace.y
-            if sequencing_type == 'single':
-                n = frequencies['total_bases']
-            else:
-                end = '5_prime' if "5' End" in trace.name else '3_prime'
-                n = frequencies[end]['total_bases']
-            
-            hover_text = [
-                f'Position: {p}<br>'
-                f'Frequency: {f:.4f}<br>'
-                f'Sample size: {s:,}<br>'
-                f'95% CI: [{l:.4f}, {u:.4f}]'
-                for p, f, s, l, u in zip(
-                    pos, freq, n,
-                    lower_bounds, upper_bounds
-                )
-            ]
-            trace.hovertemplate = '%{text}<extra></extra>'
-            trace.text = hover_text
-
     return fig
+
 
 
 
@@ -1392,32 +1790,41 @@ def get_mismatch_frequency_data(frequencies, sequencing_type):
 
     if sequencing_type == 'single':
         text_output = "Mismatch Frequency vs Distance from Read End:\n"
-        max_distance = len(frequencies['C>T'])
-        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        max_distance = len(frequencies['C>T_CpG'])
+        text_output += "Position\tC>T (CpG)\tC>T (non-CpG)\tOther\tSample Sizes\n"
         for i in range(max_distance):
-            ct_freq = frequencies['C>T'][i]
-            ga_freq = frequencies['G>A'][i]
+            cpg_freq = frequencies['C>T_CpG'][i]
+            nonCpg_freq = frequencies['C>T_nonCpG'][i]
             other_freq = frequencies['other'][i]
-            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+            cpg_sites = frequencies['CpG_sites'][i]
+            nonCpg_sites = frequencies['nonCpG_sites'][i]
+            other_sites = frequencies['other_sites'][i]
+            text_output += f"{i}\t{cpg_freq:.4f}\t{nonCpg_freq:.4f}\t{other_freq:.4f}\t[CpG: {cpg_sites}, non-CpG: {nonCpg_sites}, other: {other_sites}]\n"
     elif sequencing_type == 'double':
         text_output = "Mismatch Frequency vs Distance from Read Ends:\n"
         text_output += "\n5' End:\n"
-        max_distance_5p = len(frequencies['5_prime']['C>T'])
-        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        max_distance_5p = len(frequencies['5_prime']['C>T_CpG'])
+        text_output += "Position\tC>T (CpG)\tC>T (non-CpG)\tOther\tSample Sizes\n"
         for i in range(max_distance_5p):
-            ct_freq = frequencies['5_prime']['C>T'][i]
-            ga_freq = frequencies['5_prime']['G>A'][i]
+            cpg_freq = frequencies['5_prime']['C>T_CpG'][i]
+            nonCpg_freq = frequencies['5_prime']['C>T_nonCpG'][i]
             other_freq = frequencies['5_prime']['other'][i]
-            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+            cpg_sites = frequencies['5_prime']['CpG_sites'][i]
+            nonCpg_sites = frequencies['5_prime']['nonCpG_sites'][i]
+            other_sites = frequencies['5_prime']['other_sites'][i]
+            text_output += f"{i}\t{cpg_freq:.4f}\t{nonCpg_freq:.4f}\t{other_freq:.4f}\t[CpG: {cpg_sites}, non-CpG: {nonCpg_sites}, other: {other_sites}]\n"
 
         text_output += "\n3' End:\n"
-        max_distance_3p = len(frequencies['3_prime']['C>T'])
-        text_output += "Position\tC>T Frequency\tG>A Frequency\tOther Frequency\n"
+        max_distance_3p = len(frequencies['3_prime']['C>T_CpG'])
+        text_output += "Position\tC>T (CpG)\tC>T (non-CpG)\tOther\tSample Sizes\n"
         for i in range(max_distance_3p):
-            ct_freq = frequencies['3_prime']['C>T'][i]
-            ga_freq = frequencies['3_prime']['G>A'][i]
+            cpg_freq = frequencies['3_prime']['C>T_CpG'][i]
+            nonCpg_freq = frequencies['3_prime']['C>T_nonCpG'][i]
             other_freq = frequencies['3_prime']['other'][i]
-            text_output += f"{i}\t{ct_freq:.4f}\t{ga_freq:.4f}\t{other_freq:.4f}\n"
+            cpg_sites = frequencies['3_prime']['CpG_sites'][i]
+            nonCpg_sites = frequencies['3_prime']['nonCpG_sites'][i]
+            other_sites = frequencies['3_prime']['other_sites'][i]
+            text_output += f"{i}\t{cpg_freq:.4f}\t{nonCpg_freq:.4f}\t{other_freq:.4f}\t[CpG: {cpg_sites}, non-CpG: {nonCpg_sites}, other: {other_sites}]\n"
     else:
         text_output = "Unknown sequencing type.\n"
 
@@ -1461,7 +1868,11 @@ def create_mapq_histogram(mapq_scores):
         dragmode='select',
         newselection_line_width=2,
         newselection_line_color=colors['secondary'],
-        newselection_line_dash='dashdot'
+        newselection_line_dash='dashdot',
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
     return fig
 
@@ -1500,12 +1911,95 @@ def create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
         font=dict(color=colors['muted']),
-        legend=dict(x=0.85, y=1.15, font=dict(color=colors['muted']))
+        legend=dict(x=0.85, y=1.15, font=dict(color=colors['muted'])),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
     return fig
 
 
 
+def create_light_theme_figure(fig, width=1200, height=800):
+    """
+    Create a light theme version of a plotly figure with custom dimensions
+    
+    Parameters:
+    -----------
+    fig : plotly.graph_objects.Figure
+        Original figure to convert
+    width : int
+        Width of the exported plot in pixels
+    height : int
+        Height of the exported plot in pixels
+    """
+    light_fig = go.Figure(fig)
+    light_fig.update_layout(
+        paper_bgcolor='white',
+        plot_bgcolor='white',
+        font=dict(color='black', size=14),  # Increased font size for better readability
+        width=width,
+        height=height,
+        margin=dict(l=80, r=40, t=60, b=60),  # Adjusted margins for better layout
+    )
+    
+    # Update grid colors and axis properties
+    light_fig.update_xaxes(
+        gridcolor='lightgrey', 
+        color='black',
+        tickfont=dict(size=12),
+        titlefont=dict(size=14)
+    )
+    light_fig.update_yaxes(
+        gridcolor='lightgrey', 
+        color='black',
+        tickfont=dict(size=12),
+        titlefont=dict(size=14)
+    )
+    
+    # Update trace colors and sizes
+    for trace in light_fig.data:
+        if trace.type == 'scatter':
+            if trace.line.color == colors['line']:
+                trace.line.color = '#1f77b4'
+                trace.line.width = 2  # Increased line width
+            elif trace.line.color == colors['highlight']:
+                trace.line.color = '#d62728'
+                trace.line.width = 2
+        elif trace.type == 'bar':
+            if trace.marker.color == colors['marker']:
+                trace.marker.color = '#2ca02c'
+    
+    return light_fig
+
+def export_plot_to_file(fig, filename, width=1200, height=800, scale=2, format='png'):
+    """
+    Export a plot to specified format in light theme with custom dimensions
+    
+    Parameters:
+    -----------
+    fig : plotly.graph_objects.Figure
+        Figure to export
+    filename : str
+        Output filename
+    width : int
+        Width of the exported plot in pixels
+    height : int
+        Height of the exported plot in pixels
+    scale : int
+        Scale factor for resolution
+    format : str
+        Export format ('png', 'svg', or 'pdf')
+    """
+    light_fig = create_light_theme_figure(fig, width=width, height=height)
+    
+    if format == 'svg':
+        pio.write_image(light_fig, filename, format='svg')
+    elif format == 'pdf':
+        pio.write_image(light_fig, filename, format='pdf')
+    else:  # default to png
+        pio.write_image(light_fig, filename, scale=scale)
 
 
 
@@ -1520,6 +2014,39 @@ def create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 ######## ##     ##    ##     #######   #######     ##
 
 #######################################################
+
+def create_merge_modal():
+    """Create modal for selecting files to merge"""
+    return dbc.Modal([
+        dbc.ModalHeader("Merge Files"),
+        dbc.ModalBody([
+            dbc.Alert(
+                "Only files of the same type can be merged (e.g., all BAM or all FASTQ)",
+                color="info",
+                dismissable=True
+            ),
+            dbc.Checklist(
+                id='merge-file-checklist',
+                options=[],
+                value=[],
+                switch=True,
+            ),
+            dbc.Progress(
+                id="merge-progress",
+                value=0,
+                striped=True,
+                animated=True,
+                className="mb-3"
+            ),
+            html.Div(id="merge-status"),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Merge Selected", id="execute-merge-button", color="primary", className="me-2"),
+            dbc.Button("Close", id="close-merge-modal", className="ms-2")
+        ])
+    ], id="merge-modal", size="lg")
+
+
 
 settings_offcanvas = dbc.Offcanvas(
     [
@@ -1700,6 +2227,125 @@ settings_offcanvas = dbc.Offcanvas(
                         ),
                     ], width=6),
                 ], className="g-2"),
+            ]),
+        ], className="mb-3", style={"background-color": colors['surface']}),
+
+        # Add Plot Export Settings Section
+        dbc.Card([
+            dbc.CardHeader(
+                dbc.Row([
+                    dbc.Col(DashIconify(icon="mdi:chart-box", width=20, color=colors['on_surface']), width="auto"),
+                    dbc.Col(html.Span("Plot Export Settings", style={"margin-left": "8px"})),
+                ], align="center"),
+                style={"background-color": colors['surface'], "color": colors['muted']}
+            ),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Export Format", style={"color": colors['muted'], "margin-bottom": "4px"}),
+                        dbc.Select(
+                            id="plot-format-select",
+                            options=[
+                                {"label": "PNG", "value": "png"},
+                                {"label": "SVG", "value": "svg"},
+                                {"label": "PDF", "value": "pdf"}
+                            ],
+                            value="png",
+                            style={
+                                "background-color": colors['surface'],
+                                "color": colors['on_surface'],
+                                "border": f"1px solid {colors['muted']}",
+                                "width": "100%",
+                                "margin-bottom": "25px"
+                            }
+                        )
+
+                    ], width=12),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Plot Width (px)", style={"color": colors['muted'], "margin-bottom": "4px"}),
+                        dbc.Input(
+                            id="plot-width-input",
+                            type="number",
+                            value=1200,
+                            min=600,
+                            max=3000,
+                            step=100,
+                            style={
+                                "background-color": colors['surface'],
+                                "color": colors['on_surface'],
+                                "border": f"1px solid {colors['muted']}",
+                                "width": "100%",
+                                "margin-bottom": "10px"
+                            }
+                        ),
+                    ], width=12),
+                ], className="mb-3"),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Plot Height (px)", style={"color": colors['muted'], "margin-bottom": "4px"}),
+                        dbc.Input(
+                            id="plot-height-input",
+                            type="number",
+                            value=800,
+                            min=400,
+                            max=2000,
+                            step=100,
+                            style={
+                                "background-color": colors['surface'],
+                                "color": colors['on_surface'],
+                                "border": f"1px solid {colors['muted']}",
+                                "width": "100%",
+                                "margin-bottom": "10px"
+                            }
+                        ),
+                    ], width=12),
+                ], className="mb-3"),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Scale Factor", style={"color": colors['muted'], "margin-bottom": "4px"}),
+                        dbc.Input(
+                            id="plot-scale-input",
+                            type="number",
+                            value=2,
+                            min=1,
+                            max=4,
+                            step=1,
+                            style={
+                                "background-color": colors['surface'],
+                                "color": colors['on_surface'],
+                                "border": f"1px solid {colors['muted']}",
+                                "width": "100%",
+                                "margin-bottom": "10px"
+                            }
+                        ),
+                        html.Small(
+                            "Scale factor only applies to PNG format",
+                            className="text-muted",
+                            style={"display": "block", "margin-bottom": "15px"}
+                        )
+                    ], width=12),
+                ], className="mb-3"),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Button(
+                            [
+                                DashIconify(icon="mdi:chart-box-plus-outline", className="me-2"),
+                                "Export All Plots"
+                            ],
+                            id="export-plots-button",
+                            color="secondary",
+                            className="w-100",
+                            style={"margin-top": "10px"}
+                        ),
+                    ], width=12),
+                ]),
+                html.Small(
+                    "Plots will be exported in light theme for publication use.",
+                    className="text-muted mt-2",
+                    style={"display": "block"}
+                ),
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
@@ -1949,7 +2595,7 @@ layout_file_viewer = dbc.Container([
                         children=html.Div(id='file-viewer-content', style={"max-height": "1000px", "overflow": "auto", "padding": "10px", "background-color": colors['surface'], "border-radius": "4px"})
                     ),
 
-                    dcc.Store(id='viewer-page-index', data=0),
+                    
                 ])
             ], className="mb-4")
         ], width=11),
@@ -1980,6 +2626,7 @@ navbar = dbc.Navbar(
                 dbc.NavItem(dcc.Link("Simulation", href="/simulation", className="nav-link")),
                 dbc.NavItem(dcc.Link("Convert", href="/convert", className="nav-link")),
                 dbc.NavItem(dcc.Link("File Viewer", href="/file-viewer", className="nav-link")),
+                dbc.NavItem(dbc.Button("Console", id="console-button", color="light", outline=True, className="me-2")),
                 dbc.NavItem(dbc.Button("Settings", id="settings-button", color="light", outline=True)),
             ], className="ms-auto", navbar=True),
             id="navbar-collapse",
@@ -1997,9 +2644,11 @@ navbar = dbc.Navbar(
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     navbar,
+    create_merge_modal(),
     html.Div(id='page-content'),
     # Stores and Download components
     dcc.Store(id='file-store', data={'files': []}),
+    dcc.Store(id='viewer-page-index', data=0),
     dcc.Store(id='selected-lengths', data=[]),
     dcc.Store(id='read-length-selection-store'),
     dcc.Store(id='selected-cg-contents', data=[]),
@@ -2008,6 +2657,11 @@ app.layout = html.Div([
     dcc.Store(id='centrifuge-task-id'),
     dcc.Store(id='centrifuge-output-path'),
     dcc.Download(id="download-file"),
+    dcc.Download(id="download-plots"),
+    dcc.Download(id='download-merged-file'),
+    dcc.Store(id='merged-file-store', data=None),
+    dcc.Store(id='mapdamage-task-id'),
+    dcc.Store(id='mapdamage-output-dir'),
 ])
 
 
@@ -2051,9 +2705,7 @@ layout_convert = dbc.Container([
 
 
 layout_main = dbc.Container([
-    # Main content
     dbc.Row([
-        # Sidebar
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
@@ -2065,6 +2717,12 @@ layout_main = dbc.Container([
                         clearable=False,
                         placeholder="Select a file",
                         className="mb-4",
+                    ),
+                    dbc.Button(
+                        [DashIconify(icon="mdi:file-multiple", className="me-2"), "Merge Files"],
+                        id={"type": "merge-files-button", "index": 0},  
+                        color="info",
+                        className="w-100 mb-3"
                     ),
                     html.Label("Sequencing Type:", className="mt-3 mb-2"),
                     dcc.RadioItems(
@@ -2090,18 +2748,16 @@ layout_main = dbc.Container([
                         updatemode='drag',
                         className="mb-3",
                     ),
-                    dbc.Label("Minimum Base Quality: ", className="mt-3"),
+                    html.Label("Minimum Base Quality:", className="mt-3"),
                     dcc.Input(
                         id='min-base-quality',
                         type='number',
                         value=20,
-                        className="mb-3",
+                        className="w-100 mb-3",
                         style={
                             "background-color": colors['surface'],
                             "color": colors['on_surface'],
                             "border": f"1px solid {colors['muted']}",
-                            "width": "100%",
-                            "margin-bottom": "10px"
                         }
                     ),
                     html.Label("Mismatch Filter (BAM/SAM only):", className="mb-2"),
@@ -2162,93 +2818,92 @@ layout_main = dbc.Container([
 
         # Main content area
         dbc.Col([
-            dbc.Row([
-                # Upload Files Section
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardBody([
-                            html.H2("Upload Files", className="card-title mb-4", id="upload"),
-                            dcc.Upload(
-                                id='upload-data',
-                                children=html.Div([
-                                    DashIconify(icon="mdi:cloud-upload", width=64, color=colors['secondary']),
-                                    html.Div("Drag and Drop or Click to Select Files", className="mt-2"),
-                                    html.Div("Supported formats: BAM, SAM, FASTA, FASTQ", className="text-muted"),
-                                ]),
-                                multiple=True,
-                                className="upload-box",
-                            ),
-                        ])
-                    ], className="mb-4")
-                ], width=12),
-            ]),
+            # Upload Files Section
+            dbc.Card([
+                dbc.CardBody([
+                    html.H2("Upload Files", className="card-title mb-4", id="upload"),
+                    dcc.Upload(
+                        id='upload-data',
+                        children=html.Div([
+                            DashIconify(icon="mdi:cloud-upload", width=64, color=colors['secondary']),
+                            html.Div("Drag and Drop or Click to Select Files", className="mt-2"),
+                            html.Div("Supported formats: BAM, SAM, FASTA, FASTQ", className="text-muted"),
+                        ]),
+                        multiple=True,
+                        className="upload-box",
+                    ),
+                ])
+            ], className="mb-4"),
 
-            dbc.Row([
-                # Analysis Results Section
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardBody([
-                            html.H2("Analysis Results", className="card-title mb-4", id="analyze"),
-                            dcc.Loading(
-                                id="loading-graphs",
-                                type="circle",
-                                children=dbc.Tabs([
-                                    dbc.Tab(dcc.Graph(id='read-length-histogram'), label="Read Length"),
-                                    dbc.Tab(dcc.Graph(id='overall-cg-histogram'), label="Overall CG"),
-                                    dbc.Tab(dcc.Graph(id='cg-content-histogram'), label="CG Distribution"),
-                                    dbc.Tab(dcc.Graph(id='damage-patterns'), label="Damage Patterns"),
-                                    dbc.Tab(dcc.Graph(id='mismatch-frequency-plot'), label="Mismatch Frequency"),
-                                    dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart'), label="Mismatch Types"),
-                                    dbc.Tab(dcc.Graph(id='damage-pattern-plot'), label="Damage Patterns Along Reads"),
-                                    dbc.Tab(dcc.Graph(id='mapq-histogram'), label="MAPQ Distribution"),
-                                    dbc.Tab(html.Pre(id='data-summary', style={'whiteSpace': 'pre-wrap'}), label="Data Summary"),
-                                ]),
-                            ),
+            # Analysis Results Section
+            dbc.Card([
+                dbc.CardBody([
+                    html.H2("Analysis Results", className="card-title mb-4", id="analyze"),
+                    dcc.Loading(
+                        id="loading-graphs",
+                        type="circle",
+                        children=dbc.Tabs([
+                            dbc.Tab(dcc.Graph(id='read-length-histogram', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Read Length"),
+                            dbc.Tab(dcc.Graph(id='overall-cg-histogram', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Overall CG"),
+                            dbc.Tab(dcc.Graph(id='cg-content-histogram', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="CG Distribution"),
+                            dbc.Tab(dcc.Graph(id='damage-patterns', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Damage Patterns"),
+                            dbc.Tab(dcc.Graph(id='mismatch-frequency-plot', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Mismatch Frequency"),
+                            dbc.Tab(dcc.Graph(id='mismatch-type-bar-chart', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Mismatch Types"),
+                            dbc.Tab(dcc.Graph(id='damage-pattern-plot', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="Damage Patterns Along Reads"),
+                            dbc.Tab(dcc.Graph(id='mapq-histogram', config={'modeBarButtonsToAdd': ['downloadSVG'], 'displaylogo': False}), label="MAPQ Distribution"),
+                            dbc.Tab(html.Pre(id='data-summary', style={'whiteSpace': 'pre-wrap'}), label="Data Summary"),
                         ])
-                    ], className="mb-4")
-                ], width=12),
-            ]),
+                    ),
+                    html.Div([
+                        dbc.Button(
+                            [
+                                DashIconify(icon="mdi:download", className="me-2"),
+                                "Export Plots"
+                            ],
+                            id="export-plots-button",
+                            color="secondary",
+                            className="mb-3 mt-3"
+                        ),
+                        dcc.Download(id="download-plots")
+                    ], className="d-flex justify-content-end"),    
+                ])
+            ], className="mb-4"),
 
-            dbc.Row([
-                # MapDamage2 Analysis Section
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardBody([
-                            html.H2("mapDamage2 Analysis", className="card-title mb-4"),
-                            html.Label("Select BAM File:", className="mb-2"),
-                            dcc.Dropdown(
-                                id='mapdamage-bam-selector',
-                                options=[],  # Will be populated dynamically
-                                value=None,
-                                clearable=False,
-                                placeholder="Select a BAM file",
-                                className="mb-4",
-                            ),
-                            html.Label("Select Reference Genome (FASTA):", className="mb-2"),
-                            dcc.Dropdown(
-                                id='mapdamage-ref-selector',
-                                options=[],  # Will be populated dynamically
-                                value=None,
-                                clearable=False,
-                                placeholder="Select a reference genome",
-                                className="mb-4",
-                            ),
-                            dbc.Button("Run mapDamage2 Analysis", id="run-mapdamage-button", color="primary"),
-                            html.Div(id="mapdamage-status", className="mt-3"),
-                            dcc.Loading(
-                                id="loading-mapdamage",
-                                type="circle",
-                                children=[
-                                    html.Div(id='mapdamage-output')
-                                ]
-                            ),
-                            dcc.Interval(id='mapdamage-interval', interval=5000, n_intervals=0, disabled=True),
-                            dcc.Store(id='mapdamage-task-id'),
-                            dcc.Store(id='mapdamage-output-dir'),
-                        ])
-                    ])
-                ], width=12),
-            ])
+            # MapDamage2 Analysis Section
+            dbc.Card([
+                dbc.CardBody([
+                    html.H2("mapDamage2 Analysis", className="card-title mb-4"),
+                    html.Label("Select BAM File:", className="mb-2"),
+                    dcc.Dropdown(
+                        id='mapdamage-bam-selector',
+                        options=[],
+                        value=None,
+                        clearable=False,
+                        placeholder="Select a BAM file",
+                        className="mb-4",
+                    ),
+                    html.Label("Select Reference Genome (FASTA):", className="mb-2"),
+                    dcc.Dropdown(
+                        id='mapdamage-ref-selector',
+                        options=[],
+                        value=None,
+                        clearable=False,
+                        placeholder="Select a reference genome",
+                        className="mb-4",
+                    ),
+                    dbc.Button("Run mapDamage2 Analysis", id="run-mapdamage-button", color="primary"),
+                    html.Div(id="mapdamage-status", className="mt-3"),
+                    dcc.Loading(
+                        id="loading-mapdamage",
+                        type="circle",
+                        children=[
+                            html.Div(id='mapdamage-output')
+                        ]
+                    ),
+                    dcc.Interval(id='mapdamage-interval', interval=5000, n_intervals=0, disabled=True),
+                    
+                ])
+            ], className="mb-4"),
         ], width=9),
     ]),
 
@@ -2264,16 +2919,11 @@ layout_main = dbc.Container([
     # Settings offcanvas
     settings_offcanvas,
 
-    # # Stores and Download component
-    # dcc.Store(id='file-store', data={'files': []}),
-    # dcc.Store(id='selected-lengths', data=[]),
-    # dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
-    # dcc.Interval(id='console-interval', interval=2000, n_intervals=0),
-    # dcc.Store(id='centrifuge-task-id'),
-    # dcc.Store(id='centrifuge-output-path'),
-    # dcc.Download(id="download-file"),
+    # Stores and Download component
+
 
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
+
 
 app.validation_layout = html.Div([
     app.layout,
@@ -2486,7 +3136,7 @@ def display_file_content(
     # load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct, exclusively_ct, ct_count_value,
-        ct_checklist_tuple, mapq_range_tuple
+        ct_checklist_tuple, mapq_range_tuple, min_base_quality
     )
 
 
@@ -2710,6 +3360,347 @@ def load_reference_sequences(file_store_data): # unused for now, not necessary
 
 
 ###################################
+
+
+###################################
+
+file_merger = FileMerger()
+
+@app.callback(
+    [
+        Output('merge-modal', 'is_open'),
+        Output('merge-status', 'children'),
+        Output('merge-file-checklist', 'options'),
+        Output('merge-progress', 'value'),
+        Output('merged-file-store', 'data')
+    ],
+    [
+        Input({"type": "merge-files-button", "index": ALL}, 'n_clicks'),  # Pattern matching
+        Input('close-merge-modal', 'n_clicks'),
+        Input('execute-merge-button', 'n_clicks')
+    ],
+    [
+        State('merge-file-checklist', 'value'),
+        State('merge-modal', 'is_open'),
+        State('file-store', 'data')
+    ],
+    prevent_initial_call=True
+)
+def handle_merge_operations(merge_clicks, close_clicks, execute_clicks, 
+                            selected_files, is_open, store_data):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+        
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Generate checklist options from stored files
+    checklist_options = []
+    if store_data and 'files' in store_data:
+        first_file_format = None
+        for file in store_data['files']:
+            if first_file_format is None:
+                first_file_format = file['format']
+            if file['format'] == first_file_format:
+                checklist_options.append({
+                    'label': file['filename'],
+                    'value': file['filename']
+                })
+    
+    # Handle the pattern-matching trigger ID
+    if triggered_id.startswith('{'):
+        trigger_dict = json.loads(triggered_id)
+        if trigger_dict.get('type') == 'merge-files-button':
+            index = int(trigger_dict.get('index'))
+            n_clicks = merge_clicks[index]
+            if n_clicks and n_clicks > 0:
+                return True, "", checklist_options, 0, None
+            else:
+                raise PreventUpdate
+
+    if triggered_id == "close-merge-modal":
+        return False, "", checklist_options, 0, None
+
+    elif triggered_id == "execute-merge-button" and selected_files:
+        try:
+            files_to_merge = [f for f in store_data['files'] 
+                              if f['filename'] in selected_files]
+
+            if not files_to_merge:
+                error_message = html.Div([
+                    html.P("No files selected for merging.", className="text-danger")
+                ])
+                return is_open, error_message, checklist_options, 0, None
+
+            if len(files_to_merge) < 2:
+                error_message = html.Div([
+                    html.P("Please select at least two files to merge.", className="text-danger")
+                ])
+                return is_open, error_message, checklist_options, 0, None
+
+            formats = set(f['format'] for f in files_to_merge)
+            if len(formats) > 1:
+                error_message = html.Div([
+                    html.P("Cannot merge files of different formats.", className="text-danger")
+                ])
+                return is_open, error_message, checklist_options, 0, None
+
+            current_progress = {"value": 0}
+            def progress_callback(value, message):
+                current_progress["value"] = value
+
+            # Merge the files based on their format
+            if files_to_merge[0]['format'] in ['bam', 'sam']:
+                merged_content = merge_bam_files(files_to_merge, progress_callback)
+            else:
+                merged_content = merge_sequence_files(files_to_merge, files_to_merge[0]['format'])
+
+            # Create merged file data
+            merged_file_data = {
+                'filename': f"merged_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.{files_to_merge[0]['format']}",
+                'content': merged_content,
+                'format': files_to_merge[0]['format']
+            }
+
+            success_message = html.Div([
+                html.P("Merge completed successfully! Downloading merged file...", className="text-success"),
+                html.P(f"Merged {len(selected_files)} files.", className="text-info")
+            ])
+
+            return False, success_message, checklist_options, 100, merged_file_data
+
+        except Exception as e:
+            error_message = html.Div([
+                html.P("Error merging files:", className="text-danger"),
+                html.P(str(e), className="text-danger"),
+            ])
+            return is_open, error_message, checklist_options, 0, None
+
+    return is_open, "", checklist_options, 0, None
+
+# New callback to handle the download of merged files
+@app.callback(
+    Output('download-merged-file', 'data'),
+    Input('merged-file-store', 'data'),
+    prevent_initial_call=True
+)
+def download_merged_file(merged_file_data):
+    if not merged_file_data:
+        raise PreventUpdate
+    
+    # Create a temporary file for the merged content
+    temp_dir = os.path.join(CUSTOM_TEMP_DIR, f"merge_{uuid.uuid4()}")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, merged_file_data['filename'])
+    
+    try:
+        # Decode and write the merged content
+        content = base64.b64decode(merged_file_data['content'])
+        with open(temp_path, 'wb') as f:
+            f.write(content)
+        
+        # Trigger the download
+        return dcc.send_file(temp_path)
+    finally:
+        # Cleanup
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if os.path.exists(temp_dir):
+            os.rmdir(temp_dir)
+
+def merge_bam_files(files, progress_callback=None):
+    """
+    Merge BAM/SAM files with proper indexing and progress tracking
+    
+    Parameters:
+    -----------
+    files : list
+        List of dictionaries containing file information
+    progress_callback : callable
+        Function to call with progress updates (0-100)
+    """
+    file_handles = []
+    temp_files = []
+    
+    try:
+        # Calculate total reads for progress tracking
+        total_reads = 0
+        processed_reads = 0
+        
+        # First, convert any SAM files to BAM and index all files
+        for file_data in files:
+            temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+            temp_files.append(temp_file_path)
+            
+            # Convert SAM to BAM if necessary
+            if file_data['format'] == 'sam':
+                bam_path = os.path.join(CUSTOM_TEMP_DIR, f"temp_{uuid.uuid4()}.bam")
+                with pysam.AlignmentFile(temp_file_path, "r") as samfile:
+                    with pysam.AlignmentFile(bam_path, "wb", header=samfile.header) as bamfile:
+                        for read in samfile:
+                            bamfile.write(read)
+                temp_file_path = bam_path
+                temp_files.append(bam_path)
+            
+            # Count reads using pysam.view
+            total_reads += sum(1 for _ in pysam.view("-c", temp_file_path, catch_stdout=True))
+            
+            # Open the BAM file
+            bamfile = pysam.AlignmentFile(temp_file_path, "rb")
+            file_handles.append(bamfile)
+        
+        if progress_callback:
+            progress_callback(5, "Counted total reads")
+            
+        # Collect reference sequences from all files
+        all_references = set()
+        reference_lengths = {}
+        header_dict = None
+        
+        for bamfile in file_handles:
+            if header_dict is None:
+                header_dict = bamfile.header.to_dict()
+            
+            for ref, length in zip(bamfile.references, bamfile.lengths):
+                all_references.add(ref)
+                if ref in reference_lengths:
+                    if reference_lengths[ref] != length:
+                        raise ValueError(f"Inconsistent reference lengths for {ref}")
+                else:
+                    reference_lengths[ref] = length
+                    
+        if progress_callback:
+            progress_callback(10, "Collected reference sequences")
+
+        # Create new unified header
+        new_header = {
+            'HD': header_dict.get('HD', {'VN': '1.6', 'SO': 'coordinate'}),
+            'SQ': [{'SN': ref, 'LN': reference_lengths[ref]} for ref in sorted(all_references)],
+            'PG': header_dict.get('PG', [])
+        }
+        
+        # Create reference name mapping
+        ref_to_id = {ref: idx for idx, ref in enumerate(sorted(all_references))}
+        
+        # Create temporary merged BAM file
+        temp_merged = os.path.join(CUSTOM_TEMP_DIR, f"temp_merged_{uuid.uuid4()}.bam")
+        temp_files.append(temp_merged)
+        
+        with pysam.AlignmentFile(temp_merged, "wb", header=new_header) as outfile:
+            for i, bamfile in enumerate(file_handles):
+                # Instead of using fetch, iterate through the file directly
+                for read in bamfile:
+                    # Handle reference IDs correctly
+                    if not read.is_unmapped:
+                        try:
+                            old_ref_name = bamfile.get_reference_name(read.reference_id)
+                            read.reference_id = ref_to_id[old_ref_name]
+                            
+                            # Update mate reference if paired
+                            if read.is_paired and not read.mate_is_unmapped:
+                                old_mate_ref_name = bamfile.get_reference_name(read.next_reference_id)
+                                read.next_reference_id = ref_to_id[old_mate_ref_name]
+                        except (KeyError, ValueError):
+                            # If reference name lookup fails, mark as unmapped
+                            read.is_unmapped = True
+                            read.reference_id = -1
+                            if read.is_paired:
+                                read.mate_is_unmapped = True
+                                read.next_reference_id = -1
+                    
+                    outfile.write(read)
+                    processed_reads += 1
+                    
+                    if progress_callback and processed_reads % 1000 == 0:
+                        progress = 10 + int((processed_reads / total_reads) * 80)
+                        progress_callback(progress, f"Processing file {i+1}/{len(file_handles)}")
+        
+        if progress_callback:
+            progress_callback(90, "Sorting merged file")
+            
+        # Sort and index the merged file
+        sorted_output = os.path.join(CUSTOM_TEMP_DIR, f"sorted_merged_{uuid.uuid4()}.bam")
+        temp_files.append(sorted_output)
+        
+        # Sort using pysam.sort
+        pysam.sort("-o", sorted_output, temp_merged)
+        
+        # Index the sorted file
+        pysam.index(sorted_output)
+        temp_files.append(sorted_output + '.bai')
+        
+        if progress_callback:
+            progress_callback(95, "Reading merged file")
+            
+        # Read and encode the merged file
+        with open(sorted_output, 'rb') as f:
+            content = base64.b64encode(f.read()).decode('utf-8')
+            
+        if progress_callback:
+            progress_callback(100, "Merge complete")
+            
+        return content
+        
+    finally:
+        # Clean up resources
+        for handle in file_handles:
+            handle.close()
+        
+        # Clean up temporary files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception as e:
+                print(f"Error removing temporary file {temp_file}: {e}")
+
+def merge_sequence_files(files, format_type):
+    """
+    Merge FASTA/FASTQ files with validation and error handling
+    
+    Parameters:
+    -----------
+    files : list
+        List of dictionaries containing file information
+    format_type : str
+        File format ('fasta' or 'fastq')
+    """
+    merged_records = []
+    used_ids = set()
+    
+    for file_data in files:
+        temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+        for record in SeqIO.parse(temp_file_path, format_type):
+            # Handle potential duplicate IDs
+            original_id = record.id
+            counter = 1
+            while record.id in used_ids:
+                record.id = f"{original_id}_{counter}"
+                counter += 1
+            
+            used_ids.add(record.id)
+            merged_records.append(record)
+    
+    # Create temporary merged file
+    temp_merged = os.path.join(CUSTOM_TEMP_DIR, f"temp_merged_{uuid.uuid4()}.{format_type}")
+    SeqIO.write(merged_records, temp_merged, format_type)
+    
+    # Convert to base64
+    with open(temp_merged, 'rb') as f:
+        content = base64.b64encode(f.read()).decode('utf-8')
+    
+    os.remove(temp_merged)
+    return content
+
+def update_merge_progress(progress_value, status_message):
+    """Update progress bar and status message in the UI"""
+    return [
+        progress_value,
+        html.Div([
+            html.P(f"Progress: {progress_value}%"),
+            html.P(status_message)
+        ])
+    ]
 
 
 ##### Console #####################
@@ -3132,25 +4123,15 @@ def parse_and_display_centrifuge_results(report_path):
         yaxis_title='Number of Unique Reads',
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
 
     return dcc.Graph(figure=fig)
 
-
-# @celery_app.task
-# def run_centrifuge_task(file_path, output_path, report_path, db_path):
-#     centrifuge_cmd = [
-#         "centrifuge",
-#         "-x", db_path,
-#         "-U", file_path,
-#         "-S", output_path,
-#         "--report-file", report_path
-#     ]
-#     try:
-#         subprocess.run(centrifuge_cmd, check=True)
-#     except subprocess.CalledProcessError as e:
-#         raise e
 
 
 @app.callback(
@@ -3218,6 +4199,66 @@ def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path):
 ############### Main Callbacks ######################################
 
 
+
+@app.callback(
+    Output("download-plots", "data"),
+    Input("export-plots-button", "n_clicks"),
+    [State('read-length-histogram', 'figure'),
+     State('overall-cg-histogram', 'figure'),
+     State('cg-content-histogram', 'figure'),
+     State('damage-patterns', 'figure'),
+     State('mismatch-frequency-plot', 'figure'),
+     State('mismatch-type-bar-chart', 'figure'),
+     State('damage-pattern-plot', 'figure'),
+     State('plot-width-input', 'value'),
+     State('plot-height-input', 'value'),
+     State('plot-scale-input', 'value'),
+     State('plot-format-select', 'value')],
+    prevent_initial_call=True
+)
+def export_plots(n_clicks, *args):
+    if not n_clicks:
+        raise PreventUpdate
+    
+    figures = args[:-4]  # All except the last four arguments
+    width = args[-4]
+    height = args[-3]
+    scale = args[-2]
+    format_type = args[-1]
+    
+    temp_dir = os.path.join(CUSTOM_TEMP_DIR, f"plots_{uuid.uuid4()}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    plot_names = [
+        'read_length',
+        'overall_cg',
+        'cg_content',
+        'damage_patterns',
+        'mismatch_frequency',
+        'mismatch_types',
+        'damage_pattern_distribution'
+    ]
+    
+    for fig, name in zip(figures, plot_names):
+        if fig is not None:
+            export_plot_to_file(
+                fig, 
+                os.path.join(temp_dir, f"{name}.{format_type}"),
+                width=width,
+                height=height,
+                scale=scale,
+                format=format_type
+            )
+    
+    zip_path = os.path.join(CUSTOM_TEMP_DIR, f"plots_{format_type}.zip")
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for file in os.listdir(temp_dir):
+            zipf.write(os.path.join(temp_dir, file), file)
+    
+    shutil.rmtree(temp_dir)
+    
+    return dcc.send_file(zip_path)
+
 @app.callback(
     Output('ct-checklist', 'value'),
     Input('ct-checklist', 'value')
@@ -3283,100 +4324,6 @@ def update_file_store(contents, filenames, store_data, current_selection):
     return store_data, options, current_selection, bam_options, ref_options
 
 
-
-# @app.callback(
-#     Output('reference-store', 'data'),
-#     [Input('upload-reference', 'contents')],
-#     [State('upload-reference', 'filename')]
-# )
-# def store_reference_genome(content, filename):
-#     if content is None:
-#         return dash.no_update
-#     file_format = filename.split('.')[-1].lower()
-#     if file_format not in ['fasta', 'fa', 'fna']:
-#         return dash.no_update  # Only accept FASTA files
-#     # Save the reference genome
-#     ref_path = save_uploaded_file(content, filename)
-#     return {'filename': filename, 'path': ref_path}
-
-
-# @app.callback(
-#     [
-#         Output('cg-content-histogram', 'figure'),
-#         Output('selected-lengths', 'data')
-#     ],
-#     [
-#         Input('read-length-histogram', 'selectedData'),
-#     ],
-#     [
-#         State('read-length-histogram', 'figure'),
-#         State('file-store', 'data'),
-#         State('file-selector', 'value'),
-#         State('nm-dropdown', 'value'),
-#         State('ct-checklist', 'value'),
-#         State('ct-count-dropdown', 'value'),
-#         State('mapq-range', 'value'),
-#     ]
-# )
-# def update_selection(
-#     read_length_selectedData, figure_state, store_data, selected_file,
-#     selected_nm, ct_checklist, ct_count_value, mapq_range
-# ):
-#     if selected_file is None or read_length_selectedData is None:
-#         raise dash.exceptions.PreventUpdate
-
-#     ct_checklist_tuple = tuple(ct_checklist)
-#     mapq_range_tuple = tuple(mapq_range)
-
-#     # Prepare C>T filters
-#     filter_ct = None
-#     exclusively_ct = False
-#     subtract_ct = False
-#     if 'only_ct' in ct_checklist_tuple:
-#         filter_ct = True
-#     elif 'exclude_ct' in ct_checklist_tuple:
-#         filter_ct = False
-#     elif 'exclusively_ct' in ct_checklist_tuple:
-#         exclusively_ct = True
-#     if 'subtract_ct' in ct_checklist_tuple:
-#         subtract_ct = True
-
-#     # Extract selected lengths
-#     selected_x_values = [point['x'] for point in read_length_selectedData['points']]
-#     selected_lengths = [int(x) for x in selected_x_values]
-
-#     # If no selection is made, consider all lengths
-#     if not selected_lengths:
-#         file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
-#         if file_data is None:
-#             raise dash.exceptions.PreventUpdate
-#         read_lengths, _, _ = load_and_process_file(
-#             file_data['content'], file_data['filename'], selected_nm,
-#             filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
-#         )
-#         selected_lengths = list(set(length for length, _, _, _, _, _ in read_lengths))
-
-#     # Retrieve read_lengths
-#     file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
-#     if file_data is None:
-#         raise dash.exceptions.PreventUpdate
-
-#     # Process the file to get read_lengths
-#     read_lengths, _, _ = load_and_process_file(
-#         file_data['content'], file_data['filename'], selected_nm,
-#         filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
-#     )
-
-#     # Filter read_lengths based on selected_lengths
-#     cg_contents_for_length = [cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths]
-
-#     # Create CG Content Histogram
-#     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
-
-#     # Store selected_lengths in the figure's custom data
-#     figure_state['custom_data'] = {'selected_lengths': selected_lengths}
-
-#     return cg_content_fig, figure_state
 
 
 @app.callback(
@@ -3503,7 +4450,7 @@ def update_histograms(
     # Adjust the call to load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct,
-        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
+        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple, min_base_quality
     )
 
     # Handle mismatch frequency based on file format
@@ -3533,7 +4480,11 @@ def update_histograms(
         yaxis=dict(title='Frequency', color=colors['muted']),
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted'])
+        font=dict(color=colors['muted']),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
     )
 
     # Generate CG Content Histogram based on selected_lengths
@@ -3691,7 +4642,7 @@ def export_reads(
     # Export the selected reads with filters applied
     export_selected_reads(
         read_lengths, selected_lengths, selected_cg_content, output_file_path,
-        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes
+        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes,
     )
 
     return dcc.send_file(output_file_path)
