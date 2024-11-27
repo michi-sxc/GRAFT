@@ -116,66 +116,22 @@ The setup creates the following permission structure:
 
 ### Simulation Module
 
-The simulation component generates synthetic ancient DNA sequences with configurable damage patterns and quality profiles.
+#### Fragment Length Distribution
+* Log-normal distribution
+* Mean length: 20-500 bp
+* Standard deviation: 0.1-2.0
+* Minimum/maximum length constraints
 
-#### Simulation Parameters
+#### Damage Pattern Configuration
+* 5' terminal deamination rate (0-100%)
+* 3' terminal deamination rate (0-100%)
+* Temperature factor (0.5-2.0)
+* Single/double-stranded damage pattern selection
 
-* Fragment Length Distribution:
-  ```python
-  - Distribution type: Log-normal, Gamma, Bimodal
-  - Mean length
-  - Standard deviation
-  - Length boundaries
-  - Skewness and kurtosis
-  ```
-
-* Damage Patterns:
-  ```python
-  - Terminal C>T rates (0-100%)
-  - Terminal G>A rates (0-100%)
-  - Internal damage rates
-  - Position-specific decay patterns
-  ```
-
-* Quality Score Profiles:
-  ```python
-  - Mean quality (Phred scale)
-  - Terminal quality decay
-  - Distribution shape (Normal, Gamma, Beta)
-  ```
-
-* Environmental Factors:
-  ```python
-  - Temperature (-20°C to 50°C)
-  - pH level (3-10)
-  - Humidity (0-100%)
-  - Oxygen exposure
-  ```
-
-* Chemical Modifications:
-  ```python
-  - Oxidative damage rates
-  - Abasic sites
-  - Crosslinks
-  - CpG methylation effects
-  ```
-
-* Structural Damage:
-  ```python
-  - Single-strand break rates
-  - Double-strand break rates
-  - Nick site preferences
-  ```
-
-#### Simulation Output
-
-* BAM files with:
-  - Authentic ancient DNA damage patterns
-  - Position-specific quality scores
-  - Proper CIGAR strings
-  - MD tags reflecting damage patterns
-  - NM tags for mismatch counts
-  - Mapped quality scores
+#### Strand Parameters
+* Strand bias: 0-100%
+* Reference genome length: 10kb-10Mb
+* Strand-specific damage application
 
 
 ## Configuration
