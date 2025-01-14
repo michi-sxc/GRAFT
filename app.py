@@ -113,13 +113,22 @@ def rgb_to_hex(rgb):
 
 def prepare_histogram_data(read_lengths):
     if not read_lengths:
-        # If read_lengths is empty, return empty arrays
         return np.array([]), np.array([]), np.array([])
 
     lengths = [length for length, _, _, _, _, _ in read_lengths]
-    bins = np.arange(min(lengths), max(lengths) + 1, 1)
-    hist, bin_edges = np.histogram(lengths, bins=bins)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    min_length = min(lengths)
+    max_length = max(lengths)
+    
+    # Handle case where all reads have same length
+    if min_length == max_length:
+        bins = np.array([min_length - 0.5, min_length + 0.5])
+        hist, bin_edges = np.histogram(lengths, bins=bins)
+        bin_centers = np.array([min_length])
+    else:
+        bins = np.arange(min_length, max_length + 1, 1)
+        hist, bin_edges = np.histogram(lengths, bins=bins)
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    
     return bin_centers, hist, bins
 
 
@@ -307,10 +316,9 @@ class FileMerger:
         if not files:
             return False, "No files selected for merging."
         
-        # Get first file's format
+        
         base_format = files[0]['format']
         
-        # Define compatible formats
         compatible_formats = {
             'bam': ['bam'],
             'sam': ['sam'],
@@ -439,7 +447,7 @@ def process_uploaded_file(content, filename):
     if file_ext not in ['bam', 'sam', 'fasta', 'fq', 'fna', 'fa', 'fastq']:
         raise ValueError(f"Unsupported file format: {file_ext}")
 
-    # Map file extensions to Bio.SeqIO format names
+    # file extensions to Bio.SeqIO format names
     if file_ext in ['fa', 'fna', 'fasta']:
         file_format = 'fasta'
     elif file_ext in ['fq', 'fastq']:
@@ -449,16 +457,11 @@ def process_uploaded_file(content, filename):
     else:
         raise ValueError(f"Unsupported file extension: {file_ext}")
 
-    
-    content_type, content_string = content.split(',') # content_type is necessary, VScode just doesn't see its reference
-
-    # Decode the base64-encoded string
+    content_type, content_string = content.split(',') 
     decoded = base64.b64decode(content_string)
-
     unique_filename = f"{uuid.uuid4()}_{filename}"
     temp_file_path = os.path.join(CUSTOM_TEMP_DIR, unique_filename)
 
-    # Write the decoded content to a temporary file
     with open(temp_file_path, "wb") as fp:
         fp.write(decoded)
 
@@ -466,24 +469,41 @@ def process_uploaded_file(content, filename):
 
 def export_selected_reads(
     read_lengths, selected_lengths, selected_cg_content, output_file_path,
-    original_file_path, file_format, min_base_quality, selected_nm=None, filter_ct=None, exact_ct_changes=None, 
+    original_file_path, file_format, min_base_quality, selected_nm=None, 
+    filter_ct=None, exact_ct_changes=None, soft_clip_option='show'
 ):
+    apply_base_quality_filter = min_base_quality != 'all'
+    if apply_base_quality_filter:
+        min_base_quality = int(min_base_quality)
+
     if file_format in ['bam', 'sam']:
-        with pysam.AlignmentFile(...) as outputfile:
-            for length, cg, nm, seq, read, mapq in read_lengths:
-                base_qualities = read.query_qualities
-                if base_qualities is None or min(base_qualities) < min_base_quality:
-                    continue
         with pysam.AlignmentFile(original_file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as bamfile:
             header = bamfile.header.to_dict()
 
-        # Retain all references in the header to avoid mismatch errors
         with pysam.AlignmentFile(output_file_path, "wb" if file_format == 'bam' else "w", header=header) as outputfile:
             for length, cg, nm, seq, read, mapq in read_lengths:
+                # Base quality filtering
+                base_qualities = read.query_qualities
+                if apply_base_quality_filter:
+                    if base_qualities is None:
+                        continue
+                    base_qualities = [int(q) for q in base_qualities]
+                    if min(base_qualities) < min_base_quality:
+                        continue
+
+                # Calculate effective length based on soft-clip option
+                if soft_clip_option == 'exclude_regions':
+                    effective_length = read.query_alignment_length
+                elif soft_clip_option == 'exclude_all':
+                    if 'S' in read.cigarstring:
+                        continue
+                    effective_length = len(read.query_sequence)
+                else:  # 'show' option
+                    effective_length = len(read.query_sequence)
+
+                # C>T change filtering
                 deamination_pattern = get_deamination_pattern(read)
                 ct_changes = count_ct_changes(read)
-
-                # set filters based on C>T changes
                 if filter_ct is not None:
                     has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
                     if filter_ct and not has_ct:
@@ -491,41 +511,39 @@ def export_selected_reads(
                     elif not filter_ct and has_ct:
                         continue
 
-                # set NM filter
+                # NM tag filtering
                 if selected_nm is not None and selected_nm != 'all' and nm != selected_nm:
                     continue
 
-                # set exact C>T changes filter
+                # Exact C>T changes filtering
                 if exact_ct_changes is not None and ct_changes != exact_ct_changes:
                     continue
 
-                # set selected lengths filter
-                if selected_lengths and length not in selected_lengths:
-                    continue  # Skip this read
+                # Length filtering
+                if selected_lengths and effective_length not in selected_lengths:
+                    continue
 
-                # set selected CG content filter (if applicable)
+                # CG content filtering
                 if selected_cg_content and cg not in selected_cg_content:
-                    continue  # Skip this read
+                    continue
 
                 outputfile.write(read)
-    else:
+
+    else:  # For non-BAM/SAM files
         with open(output_file_path, "w") as outputfile:
             for length, cg, _, seq, record in read_lengths:
-                # set selected lengths filter
                 if selected_lengths and length not in selected_lengths:
-                    continue  # Skip this record
-
-                # set selected CG content filter (if applicable)
+                    continue  
                 if selected_cg_content and cg not in selected_cg_content:
-                    continue  # Skip this record
-
+                    continue
                 SeqIO.write(record, outputfile, file_format)
 
 
 
-# cached results of file-processing to avoid reloading the data, but not strictly necessary
+
+# cached results of file-processing to avoid reloading the data, but not strictly necessary, you won't hit the cache size limit
 @lru_cache(maxsize=100)
-def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range, min_base_quality=None):
+def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range, min_base_quality=None, soft_clip_option='show'):
     """
     Load and process file with error handling.
     """
@@ -533,32 +551,58 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
     deduped_file_path = os.path.join(
         CUSTOM_TEMP_DIR, f"deduped_{uuid.uuid4()}_{filename}"
     )
-    
-    # Initialize read_lengths list
-    read_lengths = []
-    
+
     try:
         if file_format in ['bam', 'sam']:
             bamfile = pysam.AlignmentFile(temp_file_path, "rb" if file_format == 'bam' else "r", check_sq=False)
-            read_lengths = remove_duplicates_with_strand_check(temp_file_path, deduped_file_path, file_format)
-            
-            # Apply base quality filter
+
+            filtered_reads = []
+            for read in bamfile:
+                # Handle unmapped reads on the selected option
+                if read.is_unmapped:
+                    if soft_clip_option == 'show':
+                        read_length = len(read.query_sequence) if read.query_sequence else 0
+                        sequence = read.query_sequence if read.query_sequence else ""
+                        mapq = None
+                        nm_tag = None
+                    else:
+                        continue
+                else:
+                    if soft_clip_option == 'exclude_all' and 'S' in read.cigarstring:
+                        continue
+                    elif soft_clip_option == 'show':
+                        # Always use the full sequence length including soft clips
+                        read_length = len(read.query_sequence) if read.query_sequence else read.query_length
+                    elif soft_clip_option == 'exclude_regions':
+                        read_length = read.query_alignment_length # Excluding soft-clipped bases
+                    else:
+                        read_length = len(read.query_sequence)
+
+                    sequence = read.query_sequence if read.query_sequence is not None else ""
+                    mapq = read.mapping_quality
+                    nm_tag = read.get_tag('NM') if read.has_tag('NM') else None
+
+                filtered_reads.append((read_length, calculate_cg_content(sequence), nm_tag, sequence, read, mapq))
+            bamfile.close()
+
+            # base quality filter
             if min_base_quality is not None:
-                filtered_reads = []
-                for length, cg, nm, seq, read, mapq in read_lengths:
+                read_lengths = []
+                for length, cg, nm, seq, read, mapq in filtered_reads:
                     base_qualities = read.query_qualities
                     if base_qualities is None or (len(base_qualities) > 0 and min(base_qualities) < min_base_quality):
                         continue
-                    filtered_reads.append((length, cg, nm, seq, read, mapq))
+                    read_lengths.append((length, cg, nm, seq, read, mapq))
+            else:
                 read_lengths = filtered_reads
-            
-            # Apply MAPQ filter
+
+            # MAPQ filter
             min_mapq, max_mapq = mapq_range
             read_lengths = [
                 r for r in read_lengths
                 if r[5] is not None and min_mapq <= r[5] <= max_mapq
             ]
-            
+
             if filter_ct is not None:
                 read_lengths = [r for r in read_lengths if ('C>T' in get_deamination_pattern(r[4]) or 'G>A' in get_deamination_pattern(r[4])) == filter_ct]
 
@@ -573,10 +617,12 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
 
             if selected_nm != 'all':
                 read_lengths = [r for r in read_lengths if r[2] == selected_nm]
-                
-            bamfile.close()
-            
+
+            # Deduplicate reads after filtering
+            read_lengths = remove_duplicates_with_strand_check(temp_file_path, deduped_file_path, file_format, soft_clip_option=soft_clip_option, reads=read_lengths)
+
         else:  # Handle FASTQ/FASTA files
+            read_lengths = []
             with open(deduped_file_path, 'w') as output_file:
                 for record in SeqIO.parse(temp_file_path, file_format):
                     sequence = str(record.seq)
@@ -584,67 +630,64 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
                     cg_content = calculate_cg_content(sequence)
                     # For non-BAM/SAM files, set nm_tag and mapq to None
                     read_lengths.append((length, cg_content, None, sequence, record, None))
-                    SeqIO.write(record, output_file, file_format)
-                    
+                SeqIO.write(record, output_file, file_format)
+
     except Exception as e:
         print(f"Error processing file: {str(e)}")
         # Return empty lists if processing fails
         return [], file_format, deduped_file_path
-        
+
     return read_lengths, file_format, deduped_file_path
-
-
-def remove_duplicates_with_strand_check(input_file, output_file, file_format, apply_dust=False):
+    
+def remove_duplicates_with_strand_check(input_file, output_file, file_format, reads, apply_dust=False, soft_clip_option='show'):
     if file_format in ['bam', 'sam']:
         bamfile = pysam.AlignmentFile(input_file, "rb" if file_format == 'bam' else "r", check_sq=False)
         outputfile = pysam.AlignmentFile(output_file, "wb" if file_format == 'bam' else 'w', header=bamfile.header)
     else:
         outputfile = open(output_file, "w")
-    
+
     unique_reads = set()
-    read_lengths = []
-    
+    deduped_read_lengths = []
+
     if file_format in ['bam', 'sam']:
-        for read in bamfile:
-            sequence = read.query_sequence
-            if apply_dust:
+        for read_length, cg_content, nm_tag, sequence, read, mapq in reads:
+            # Apply DUST filter if needed
+            if apply_dust and sequence != "":
                 masked_seq = dust_module.dust_mask(sequence)
-                if set(masked_seq) == {'N'}:  # DUST masks low complexity to 'N'
+                if set(masked_seq) == {'N'}:
                     continue
-           
+
+            # Deduplication logic
             reverse_complement = str(Seq(sequence).reverse_complement())
-            previous_length = len(unique_reads)
-            unique_reads.add(sequence)
-            unique_reads.add(reverse_complement)
-            if len(unique_reads) > previous_length:
+            if sequence not in unique_reads:
+                unique_reads.add(sequence)
+                unique_reads.add(reverse_complement)
                 outputfile.write(read)
-                mapq = read.mapping_quality
-                nm_tag = read.get_tag('NM') if read.has_tag('NM') else None
-                read_lengths.append((len(sequence), calculate_cg_content(sequence), nm_tag, sequence, read, mapq))
-            else:
-                continue
+
+                # Store read information
+                deduped_read_lengths.append((read_length, cg_content, nm_tag, sequence, read, mapq))
+
     else:
-        for record in SeqIO.parse(input_file, file_format):
-            sequence = str(record.seq)
+        # Handle FASTQ/FASTA files
+        for read_length, cg_content, nm_tag, sequence, record, mapq in reads:
+            # Apply DUST filter if needed
             if apply_dust:
                 masked_seq = dust_module.dust_mask(sequence)
-                if set(masked_seq) == {'N'}:  # DUST masks low complexity to 'N'
+                if set(masked_seq) == {'N'}:
                     continue
-           
+
+            # Deduplication logic
             reverse_complement = str(Seq(sequence).reverse_complement())
-            previous_length = len(unique_reads)
-            unique_reads.add(sequence)
-            unique_reads.add(reverse_complement)
-            if len(unique_reads) > previous_length:
+            if sequence not in unique_reads:
+                unique_reads.add(sequence)
+                unique_reads.add(reverse_complement)
                 SeqIO.write(record, outputfile, file_format)
-                read_lengths.append((len(sequence), calculate_cg_content(sequence), None, sequence, record, None))
-            else:
-                continue
-    
+                deduped_read_lengths.append((read_length, cg_content, nm_tag, sequence, read, mapq))
+
     if file_format in ['bam', 'sam']:
         bamfile.close()
     outputfile.close()
-    return read_lengths
+    return deduped_read_lengths
 
 
 
@@ -721,7 +764,7 @@ def calculate_alignment_stats(file_path, file_format):
                     key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
                     mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
 
-            # Check for PCR or optical duplicates
+            # PCR or optical duplicates
             if read.is_duplicate or (read.flag & 1024):  # 1024 is BAM_FDUP flag
                 duplicate_reads += 1
         
@@ -772,7 +815,6 @@ def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
         base_quality = mismatch.get('base_quality')
         mapping_quality = mismatch.get('mapping_quality')
         
-        # Skip if quality values are missing
         if base_quality is None or mapping_quality is None:
             continue
         
@@ -782,7 +824,7 @@ def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
 
 def has_only_ct_mismatches(read):
     if read.is_unmapped:
-        return False  # Unmapped reads cannot be considered
+        return False
 
     mismatches = []
     for q_pos, r_pos, ref_base in read.get_aligned_pairs(with_seq=True):
@@ -888,7 +930,7 @@ def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths,
     
     mean_cg_content = calculate_mean_cg_content(read_lengths, bins)
 
-    # CG content markers (including zeros)
+    # CG content markers
     read_length_fig.add_trace(go.Scatter(
         x=[x - 0.5 for x in bin_centers],
         y=mean_cg_content,
@@ -987,7 +1029,7 @@ def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
     return cg_content_fig
 
 def create_mismatch_type_bar_chart(mismatch_counts):
-    # Sort mismatch types for consistent display
+    # Sort mismatches (just for consistent visualization)
     sorted_mismatches = sorted(mismatch_counts.items(), key=lambda x: (x[0][0], x[0][2]))
     mutations = [m[0] for m in sorted_mismatches]
     counts = [m[1] for m in sorted_mismatches]
@@ -1030,7 +1072,6 @@ def create_damage_pattern_plot(mismatches):
     Create a 2D heatmap showing damage patterns along read positions
     """
     if not mismatches:
-        # Return empty plot with message if no mismatches
         fig = go.Figure()
         fig.update_layout(
             title='No mismatches found in data',
@@ -1040,10 +1081,8 @@ def create_damage_pattern_plot(mismatches):
         )
         return fig
         
-    # Get the maximum read position
     max_pos = max([m['read_pos'] for m in mismatches]) + 1
     
-    # Initialize arrays for counts
     damage_counts = {
         'C>T': np.zeros(max_pos),
         'G>A': np.zeros(max_pos),
@@ -1051,7 +1090,6 @@ def create_damage_pattern_plot(mismatches):
     }
     total_bases = np.zeros(max_pos)
     
-    # Count damages
     for mismatch in mismatches:
         pos = mismatch['read_pos']
         ref_base = mismatch['ref_base']
@@ -1067,11 +1105,10 @@ def create_damage_pattern_plot(mismatches):
     
     # Create z-values for heatmap (frequencies)
     z_values = []
-    text_values = []  # For hover text
+    text_values = [] 
     damage_types = ['C>T', 'G>A', 'Other']
     
     for damage_type in damage_types:
-        # Calculate frequencies with handling for zero division
         frequencies = np.divide(
             damage_counts[damage_type],
             np.maximum(total_bases, 1),
@@ -1085,7 +1122,7 @@ def create_damage_pattern_plot(mismatches):
             for i in range(max_pos)
         ])
     
-    # Create heatmap
+    # heatmap
     fig = go.Figure(data=go.Heatmap(
         z=z_values,
         y=damage_types,
@@ -1163,7 +1200,7 @@ def create_detailed_mismatch_pie_chart(stats):
         color = color_map[base][color_index]
         colors_list.append(color)
         
-        # Convert color to RGB tuple
+        # color to RGB tuple
         if color.startswith('#'):
             rgb_color = plotly.colors.hex_to_rgb(color)
         elif color.startswith('rgb'):
@@ -1171,7 +1208,7 @@ def create_detailed_mismatch_pie_chart(stats):
         else:
             raise ValueError(f"Unsupported color format: {color}")
         
-        # Find intermediate color between white and the original color
+        # Intermediate color between white and the original color
         brightened_color = plotly.colors.find_intermediate_color((255, 255, 255), rgb_color, 0.6)
         brightened_color_hex = rgb_to_hex(brightened_color)
         brighter_colors.append(brightened_color_hex)
@@ -1179,7 +1216,6 @@ def create_detailed_mismatch_pie_chart(stats):
     labels = sorted_keys
     values = [mismatch_counts[key] for key in sorted_keys]
     
-    # Create custom texttemplate with brighter label colors
     texttemplate = [
         f'<span style="color:{brighter_colors[i]}">%{{label}}: %{{percent}}</span>' 
         for i in range(len(labels))
@@ -1269,7 +1305,7 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
     if file_format not in ['bam', 'sam']:
         return {}
         
-    max_distance = 50  # Keep your longer distance analysis
+    max_distance = 50
     counts = {
         '5_prime': {
             'C>T_CpG_counts': [0]*max_distance,
@@ -1292,7 +1328,7 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
     }
 
     for read_tuple in read_lengths:
-        read = read_tuple[4]  # Get read object from tuple
+        read = read_tuple[4]  # Get object from tuple
         if read.is_unmapped:
             continue
             
@@ -1304,7 +1340,6 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
         if seq_length == 0:
             continue
 
-        # Get aligned positions and mismatches
         aligned_pairs = read.get_aligned_pairs(with_seq=True)
         if not aligned_pairs:
             continue
@@ -1326,13 +1361,13 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
             read_base = sequence[query_pos].upper()
             ref_base = ref_base.upper()
             
-            # Check for CpG context
+            # CpG context
             is_cpg = False
             if next_pair[2] is not None and ref_base == 'C':
                 next_ref_base = next_pair[2].upper()
                 is_cpg = (next_ref_base == 'G')
             
-            # Calculate positions from both ends
+            # positions from both ends
             dist_5p = query_pos
             dist_3p = seq_length - query_pos - 1
             
@@ -1380,9 +1415,44 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
             # Similar counting for 3' end...
             if dist_3p < max_distance:
                 counts['3_prime']['total_bases'][dist_3p] += 1
-                # (Similar counting logic for 3' end)
+                if read_base != ref_base:
+                    if read.is_reverse:
+                        # Handle reverse strand
+                        if ref_base == 'G':
+                            if is_cpg:
+                                counts['3_prime']['C>T_CpG_counts'][dist_3p] += 1
+                            else:
+                                counts['3_prime']['C>T_nonCpG_counts'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['other_counts'][dist_3p] += 1
+                    else:
+                        # Handle forward strand
+                        if ref_base == 'C':
+                            if is_cpg:
+                                counts['3_prime']['C>T_CpG_counts'][dist_3p] += 1
+                            else:
+                                counts['3_prime']['C>T_nonCpG_counts'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['other_counts'][dist_3p] += 1
+                
+                # Count sites
+                if read.is_reverse:
+                    if ref_base == 'G':
+                        if is_cpg:
+                            counts['3_prime']['CpG_sites'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['nonCpG_sites'][dist_3p] += 1
+                    else:
+                        counts['3_prime']['other_sites'][dist_3p] += 1
+                else:
+                    if ref_base == 'C':
+                        if is_cpg:
+                            counts['3_prime']['CpG_sites'][dist_3p] += 1
+                        else:
+                            counts['3_prime']['nonCpG_sites'][dist_3p] += 1
+                    else:
+                        counts['3_prime']['other_sites'][dist_3p] += 1
 
-    # Calculate frequencies
     frequencies = {}
     
     if sequencing_type == 'single':
@@ -1464,7 +1534,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
             ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
             ('other', colors['highlight2'], 'diamond', 'Other')
         ]:
-            # Calculate confidence intervals using correct site keys
+            # confidence intervals calc
             site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
             
             lower_bounds, upper_bounds = calculate_confidence_intervals(
@@ -1493,7 +1563,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                 name=f'{name} 95% CI'
             ))
             
-            # Add size indicators for sample size
+            # Size indicators for sample size
             sizes = frequencies[site_key]
             normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
             
@@ -1510,7 +1580,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                 showlegend=False
             ))
             
-            # Add hover text
+            # hover text
             hover_text = [
                 f'Position: {p}<br>'
                 f'Frequency: {f:.4f}<br>'
@@ -1537,7 +1607,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                 name = f"{base_name} ({title})"
                 x_values = list(range(len(frequencies[end][mut_type])))
                 
-                # Use correct site keys
+                # correct site keys
                 site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
                 
                 lower_bounds, upper_bounds = calculate_confidence_intervals(
@@ -1566,7 +1636,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                     name=f'{name} 95% CI'
                 ))
                 
-                # Add size indicators
+                # size indicators
                 sizes = frequencies[end][site_key]
                 normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
                 
@@ -1583,7 +1653,7 @@ def create_mismatch_frequency_plot(frequencies, sequencing_type):
                     showlegend=False
                 ))
                 
-                # Add hover text
+                # hover text
                 hover_text = [
                     f'Position: {p}<br>'
                     f'Frequency: {f:.4f}<br>'
@@ -2231,7 +2301,7 @@ settings_offcanvas = dbc.Offcanvas(
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # Add Plot Export Settings Section
+        # Plot Export Settings Section
         dbc.Card([
             dbc.CardHeader(
                 dbc.Row([
@@ -2387,7 +2457,7 @@ settings_offcanvas = dbc.Offcanvas(
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # set and Reset Buttons
+        # apply and Reset Buttons
         html.Div(
             [
                 dbc.Button("Apply Settings", id="apply-settings-button", color="success", className="me-2"),
@@ -2532,7 +2602,41 @@ layout_file_viewer = dbc.Container([
                                     clearable=False,
                                     className="mb-4",
                                 ),
-                            ])
+                            ]),
+                            html.Div([
+                                html.Label("Sequence Display Legend:", className="mt-4 mb-2"),
+                                dbc.Card([
+                                    dbc.CardBody([
+                                        html.Div([
+                                            html.Span("Base Colors:", className="fw-bold"),
+                                            html.Div([
+                                                html.Span("⬤", style={"color": "blue", "margin-right": "5px"}),
+                                                html.Span("Matched bases", className="me-4"),
+                                                html.Span("⬤", style={"color": "orange", "margin-right": "5px"}),
+                                                html.Span("C→T/G→A changes", className="me-4"),
+                                                html.Span("⬤", style={"color": "red", "margin-right": "5px"}),
+                                                html.Span("Other mismatches", className="me-4"),
+                                                html.Span("⬤", style={"color": "gray", "margin-right": "5px"}),
+                                                html.Span("Soft-clipped bases", className="me-4"),
+                                            ], className="d-flex align-items-center mb-2"),
+                                        ]),
+                                        html.Div([
+                                            html.Span("Soft-clip Display:", className="fw-bold mt-2"),
+                                            dbc.RadioItems(
+                                                id='viewer-softclip-display',
+                                                options=[
+                                                    {'label': ' Show all bases', 'value': 'show_all'},
+                                                    {'label': ' Highlight soft-clipped bases', 'value': 'highlight'},
+                                                    {'label': ' Hide soft-clipped bases', 'value': 'hide'},
+                                                    {'label': ' Remove all soft-clipped sequences', 'value': 'exclude'}
+                                                ],
+                                                value='show_all',
+                                                className="mt-2"
+                                            ),
+                                        ])
+                                    ])
+                                ], className="mb-3", style={"backgroundColor": colors['surface']})
+                            ])                            
                         ], title="Filtering Options", style={"background-color": colors['surface'], "color": colors['on_surface']})
                     ], start_collapsed=True, className="mb-4"),
 
@@ -2562,7 +2666,7 @@ layout_file_viewer = dbc.Container([
                                             {'label': 'Mismatches', 'value': 'mismatches'}
                                         ],
                                         value='name',
-                                        size="sm",  # Use bs_size instead of size
+                                        size="sm",  # bs_size instead of size
                                     ),
                                     dbc.InputGroupText("Order"),
                                     dbc.Select(
@@ -2572,7 +2676,7 @@ layout_file_viewer = dbc.Container([
                                             {'label': '↓', 'value': 'desc'}
                                         ],
                                         value='asc',
-                                        size="sm",  # Use bs_size instead of size
+                                        size="sm",  # bs_size instead of size
                                     ),
                                 ], size="sm"),
                             ], width=4, className="mb-3 mb-sm-0"),
@@ -2602,11 +2706,7 @@ layout_file_viewer = dbc.Container([
         ], width=11),
     ], justify='center'),
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
-
-
-
-
-# Define the Navbar separately for reuse 
+ 
 navbar = dbc.Navbar(
     dbc.Container([
         dcc.Link(
@@ -2640,14 +2740,12 @@ navbar = dbc.Navbar(
     className="mb-4",
 )
 
-
-
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     navbar,
     create_merge_modal(),
     html.Div(id='page-content'),
-    # Stores and Download components
+    # Stores and Downloads
     dcc.Store(id='file-store', data={'files': []}),
     dcc.Store(id='viewer-page-index', data=0),
     dcc.Store(id='selected-lengths', data=[]),
@@ -2663,11 +2761,9 @@ app.layout = html.Div([
     dcc.Store(id='merged-file-store', data=None),
     dcc.Store(id='mapdamage-task-id'),
     dcc.Store(id='mapdamage-output-dir'),
+    dcc.Location(id='url', refresh=False),
 ])
 
-
-
-# Converter Page Layout
 layout_convert = dbc.Container([
     dbc.Row([
         dbc.Col([
@@ -2702,8 +2798,6 @@ layout_convert = dbc.Container([
         ], width=8),
     ], justify='center'),
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
-
-
 
 layout_main = dbc.Container([
     dbc.Row([
@@ -2761,6 +2855,18 @@ layout_main = dbc.Container([
                             "border": f"1px solid {colors['muted']}",
                         }
                     ),
+                    html.H5("Soft-Clipping Options", className="mt-4 mb-3"),
+                    dcc.RadioItems(
+                        id='soft-clip-handling',
+                        options=[
+                            {'label': ' Show reads with soft-clipped bases', 'value': 'show'},
+                            {'label': ' Exclude all reads with soft-clipped regions', 'value': 'exclude_all'},
+                            {'label': ' Exclude soft-clipped regions from reads', 'value': 'exclude_regions'}
+                        ],
+                        value='show',  # Default value
+                        labelStyle={'display': 'block'},
+                        className="mb-4",
+                    ),                    
                     html.Label("Mismatch Filter (BAM/SAM only):", className="mb-2"),
                     dcc.Dropdown(
                         id='nm-dropdown',
@@ -2833,17 +2939,6 @@ layout_main = dbc.Container([
                         multiple=True,
                         className="upload-box",
                     ),
-                ])
-            ], className="mb-4"),
-
-            # Progress Tracking Section
-            dbc.Card([
-                dbc.CardBody([
-                    html.H4("Loading Progress", className="card-title mb-4"),
-                    dcc.Store(id='task-id'),
-                    dbc.Progress(id='progress-bar', value=0, max=100, style={'height': '30px'}),
-                    html.Div(id='progress-percentage', className="mt-2"),
-                    dcc.Interval(id='interval-component', interval=1000, n_intervals=0), 
                 ])
             ], className="mb-4"),
 
@@ -2930,10 +3025,6 @@ layout_main = dbc.Container([
 
     # Settings offcanvas
     settings_offcanvas,
-
-    # Stores and Download component
-
-
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
 
 
@@ -2945,7 +3036,7 @@ app.validation_layout = html.Div([
 ])
 
 
-# Add custom CSS, have to merge with external assets css
+# custom CSS, have to merge with external assets css
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -3037,7 +3128,7 @@ app.index_string = '''
     Output('viewer-ct-checklist', 'value'),
     [Input('viewer-ct-checklist', 'value')]
 )
-def enforce_mutual_exclusivity(selected_values):
+def enforce_mutual_exclusivity(selected_values): # only one C>T checkbox can be selected at a time
     if len(selected_values) > 1:
         # Keep only the last selected option
         return [selected_values[-1]]
@@ -3054,7 +3145,7 @@ def display_page(pathname):
     elif pathname == '/simulation':
         return simulation.layout
     elif pathname == '/file-viewer':
-        return layout_file_viewer  # New File Viewer layout
+        return layout_file_viewer  
     else:
         return layout_main
 
@@ -3091,6 +3182,7 @@ def update_viewer_file_selector(store_data):
         Input('viewer-sequence-search-button', 'n_clicks'),
         Input('viewer-sort-field', 'value'),
         Input('viewer-sort-order', 'value'),
+        Input('viewer-softclip-display', 'value'),
     ],
     [
         State('viewer-sequence-search-input', 'value'),
@@ -3114,6 +3206,7 @@ def display_file_content(
     sequence_search_clicks,
     sort_field,
     sort_order,
+    softclip_display,
     sequence_search_input_value,
     store_data,
     page_index
@@ -3121,7 +3214,7 @@ def display_file_content(
     if selected_file is None:
         return html.Div("No file selected.", className="text-muted"), True, True, "", page_index
 
-    # Retrieve the file content
+    # file content
     file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
     if file_data is None:
         return html.Div("File not found.", className="text-muted"), True, True, "", page_index
@@ -3130,7 +3223,7 @@ def display_file_content(
 
     ct_checklist_tuple = tuple(ct_checklist)
 
-    # Prepare C>T filters
+    #C>T filters
     filter_ct = None
     exclusively_ct = False
     subtract_ct = False
@@ -3145,17 +3238,17 @@ def display_file_content(
     
     mapq_range_tuple = tuple(mapq_range)
 
-    # load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct, exclusively_ct, ct_count_value,
         ct_checklist_tuple, mapq_range_tuple, min_base_quality
     )
 
-
-    # set additional filters based on base quality
     if file_format in ['bam', 'sam']:
         filtered_reads = []
         for length, cg, nm, seq, read, mapq in read_lengths:
+            if softclip_display == 'exclude' and read.cigarstring and 'S' in read.cigarstring:
+                continue
+
             if read.mapping_quality < mapq_range[0] or read.mapping_quality > mapq_range[1]:
                 continue
             if min_base_quality is not None:
@@ -3165,12 +3258,11 @@ def display_file_content(
             filtered_reads.append((length, cg, nm, seq, read, mapq))
         read_lengths = filtered_reads
 
-    # Implement pagination and search functionality
+    # Pagination and search functionality
     records_per_page = 20
     ctx = dash.callback_context
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # Initialize matching_indices to all reads
     matching_indices = list(range(len(read_lengths)))
 
     if triggered_id == 'viewer-prev-button':
@@ -3194,23 +3286,19 @@ def display_file_content(
                             if search_seq in (read.query_sequence.upper() if isinstance(read, pysam.AlignedSegment) else str(read.seq).upper())]
         if not matching_indices:
             return html.Div(f"No reads found containing the sequence '{search_seq}'.", className="text-danger"), True, True, "", page_index
-        page_index = 0  # Reset to first page after search
+        page_index = 0  #reset to first page after search
     else:
         page_index = 0
-
-    # Adjust the reads to include only matching_indices
+    # filtered output
     filtered_read_lengths = [read_lengths[i] for i in matching_indices]
 
-    # Implement sorting before pagination
+
     if sort_field and sort_order:
         if sort_field == 'name':
-            # Sort by read name
             key_func = lambda x: x[4].query_name if isinstance(x[4], pysam.AlignedSegment) else x[4].id
         elif sort_field == 'length':
-            # Sort by read length
             key_func = lambda x: x[0]  # length is at index 0
         elif sort_field == 'mismatches':
-            # Sort by number of mismatches (NM tag)
             key_func = lambda x: x[2]  # nm is at index 2
         else:
             key_func = None
@@ -3244,7 +3332,7 @@ def display_file_content(
             # Retrieve reference sequence if possible
             ref_seq = get_reference_sequence(read)
             # Highlight mismatches
-            read_seq_html = highlight_mismatches(read)
+            read_seq_html = highlight_mismatches(read, softclip_display)
             # Retrieve metadata
             metadata = read.get_tags()
             metadata_info = ', '.join([f"{tag}:{value}" for tag, value in metadata])
@@ -3293,8 +3381,6 @@ def get_reference_sequence(read): # quite unneccessary, was initially implemente
     if read.is_unmapped or read.reference_id < 0:
         return None
     # need access to the reference genome sequence
-    # Assuming you have a dictionary or function that maps reference names to sequences
-    # For example, reference_sequences = {'chr1': 'ATGCT...'}
     ref_name = read.reference_name
     ref_start = read.reference_start
     ref_end = read.reference_end
@@ -3304,52 +3390,75 @@ def get_reference_sequence(read): # quite unneccessary, was initially implemente
     else:
         return None
 
-def highlight_mismatches(read):
+def highlight_mismatches(read, softclip_display='show_all'):
     read_seq = read.query_sequence
     aligned_pairs = read.get_aligned_pairs(with_seq=True)
     alignment = []
+    
+    # Parse CIGAR string to identify soft-clipped regions
+    cigar_tuples = read.cigartuples
+    soft_clipped_positions = set()
+    current_pos = 0
+    
+    for operation, length in cigar_tuples:
+        if operation == 4:  # Soft clip
+            for i in range(length):
+                soft_clipped_positions.add(current_pos + i)
+        if operation in [0, 1, 4]:  # M, I, S operations consume query sequence
+            current_pos += length
 
     for query_pos, ref_pos, ref_base in aligned_pairs:
-        if query_pos is not None:
-            read_base = read_seq[query_pos]
-
-            if ref_pos is not None and ref_base is not None:
-                # Compare read base and reference base
-                read_base_upper = read_base.upper()
-                ref_base_upper = ref_base.upper()
-
-                if read_base_upper != ref_base_upper:
-                    # Mismatch found
-                    if read.is_reverse:
-                        # Read is mapped to reverse strand
-                        if ref_base_upper == 'G' and read_base_upper == 'A':
-                            # G>A change on reverse strand (corresponds to C>T on forward strand)
-                            alignment.append(f'<span style="color: orange; font-weight: bold;">{read_base}</span>')
-                        else:
-                            # Other mismatches
-                            alignment.append(f'<span style="color: red; font-weight: bold;">{read_base}</span>')
-                    else:
-                        # Read is mapped to forward strand
-                        if ref_base_upper == 'C' and read_base_upper == 'T':
-                            # C>T change on forward strand
-                            alignment.append(f'<span style="color: orange; font-weight: bold;">{read_base}</span>')
-                        else:
-                            # Other mismatches
-                            alignment.append(f'<span style="color: red; font-weight: bold;">{read_base}</span>')
-                else:
-                    # Match
-                    alignment.append(f'<span style="color: lightblue;">{read_base}</span>')
-            else:
-                # Reference base not available (e.g., soft clipping)
-                alignment.append(f'<span style="color: gray;">{read_base}</span>')
-        else:
-            # Insertion or deletion relative to reference
+        if query_pos is None:
             alignment.append(f'<span style="color: purple; font-style: italic;">-</span>')
+            continue
+            
+        read_base = read_seq[query_pos]
+        is_softclipped = query_pos in soft_clipped_positions
+
+        if softclip_display == 'hide' and is_softclipped:
+            continue
+
+        base_style = get_base_style(
+            read_base, 
+            ref_base, 
+            is_softclipped,
+            read.is_reverse,
+            softclip_display
+        )
+        alignment.append(base_style)
 
     highlighted_seq = ''.join(alignment)
     return dash_dangerously_set_inner_html.DangerouslySetInnerHTML(
-        f'<pre style="margin: 0; font-size: 14px;">{highlighted_seq}</pre>'
+        f'<pre style="margin: 0; font-size: 14px; line-height: 1.5;">{highlighted_seq}</pre>'
     )
+
+def get_base_style(read_base, ref_base, is_softclipped, is_reverse, softclip_display):
+    """Helper function to determine base styling"""
+    base_color = "lightblue"  # default color for matched bases
+    
+    if is_softclipped:
+        if softclip_display == 'highlight':
+            return f'<span style="color: gray; background-color: #444444; padding: 0 2px;">{read_base}</span>'
+        else:
+            return f'<span style="color: gray;">{read_base}</span>'
+            
+    if ref_base is not None:
+        read_base_upper = read_base.upper()
+        ref_base_upper = ref_base.upper()
+        
+        if read_base_upper != ref_base_upper:
+            if is_reverse:
+                if ref_base_upper == 'G' and read_base_upper == 'A':
+                    base_color = "orange"
+                else:
+                    base_color = "red"
+            else:
+                if ref_base_upper == 'C' and read_base_upper == 'T':
+                    base_color = "orange"
+                else:
+                    base_color = "red"
+    
+    return f'<span style="color: {base_color};">{read_base}</span>'
 
 reference_sequences = {}
 
@@ -3362,7 +3471,6 @@ def load_reference_sequences(file_store_data): # unused for now, not necessary
     for f in file_store_data.get('files', []):
         if f['format'] in ['fasta', 'fa', 'fna']:
             temp_file_path, _ = process_uploaded_file(f['content'], f['filename'])
-            # Parse the reference genome and store sequences
             for record in SeqIO.parse(temp_file_path, 'fasta'):
                 reference_sequences[record.id] = str(record.seq)
     return {'status': 'Reference genome loaded'}
@@ -3387,7 +3495,7 @@ file_merger = FileMerger()
         Output('merged-file-store', 'data')
     ],
     [
-        Input({"type": "merge-files-button", "index": ALL}, 'n_clicks'),  # Pattern matching
+        Input({"type": "merge-files-button", "index": ALL}, 'n_clicks'), 
         Input('close-merge-modal', 'n_clicks'),
         Input('execute-merge-button', 'n_clicks')
     ],
@@ -3406,7 +3514,7 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
         
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-    # Generate checklist options from stored files
+#checklist options from stored files
     checklist_options = []
     if store_data and 'files' in store_data:
         first_file_format = None
@@ -3461,7 +3569,7 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
             def progress_callback(value, message):
                 current_progress["value"] = value
 
-            # Merge the files based on their format
+            # Merge files
             if files_to_merge[0]['format'] in ['bam', 'sam']:
                 merged_content = merge_bam_files(files_to_merge, progress_callback)
             else:
@@ -3490,7 +3598,7 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
 
     return is_open, "", checklist_options, 0, None
 
-# New callback to handle the download of merged files
+
 @app.callback(
     Output('download-merged-file', 'data'),
     Input('merged-file-store', 'data'),
@@ -3500,21 +3608,17 @@ def download_merged_file(merged_file_data):
     if not merged_file_data:
         raise PreventUpdate
     
-    # Create a temporary file for the merged content
     temp_dir = os.path.join(CUSTOM_TEMP_DIR, f"merge_{uuid.uuid4()}")
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, merged_file_data['filename'])
     
     try:
-        # Decode and write the merged content
         content = base64.b64decode(merged_file_data['content'])
         with open(temp_path, 'wb') as f:
             f.write(content)
         
-        # Trigger the download
         return dcc.send_file(temp_path)
     finally:
-        # Cleanup
         if os.path.exists(temp_path):
             os.remove(temp_path)
         if os.path.exists(temp_dir):
@@ -3535,16 +3639,13 @@ def merge_bam_files(files, progress_callback=None):
     temp_files = []
     
     try:
-        # Calculate total reads for progress tracking
         total_reads = 0
         processed_reads = 0
         
-        # First, convert any SAM files to BAM and index all files
         for file_data in files:
             temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
             temp_files.append(temp_file_path)
             
-            # Convert SAM to BAM if necessary
             if file_data['format'] == 'sam':
                 bam_path = os.path.join(CUSTOM_TEMP_DIR, f"temp_{uuid.uuid4()}.bam")
                 with pysam.AlignmentFile(temp_file_path, "r") as samfile:
@@ -3554,17 +3655,13 @@ def merge_bam_files(files, progress_callback=None):
                 temp_file_path = bam_path
                 temp_files.append(bam_path)
             
-            # Count reads using pysam.view
             total_reads += sum(1 for _ in pysam.view("-c", temp_file_path, catch_stdout=True))
-            
-            # Open the BAM file
             bamfile = pysam.AlignmentFile(temp_file_path, "rb")
             file_handles.append(bamfile)
         
         if progress_callback:
             progress_callback(5, "Counted total reads")
             
-        # Collect reference sequences from all files
         all_references = set()
         reference_lengths = {}
         header_dict = None
@@ -3584,31 +3681,23 @@ def merge_bam_files(files, progress_callback=None):
         if progress_callback:
             progress_callback(10, "Collected reference sequences")
 
-        # Create new unified header
         new_header = {
             'HD': header_dict.get('HD', {'VN': '1.6', 'SO': 'coordinate'}),
             'SQ': [{'SN': ref, 'LN': reference_lengths[ref]} for ref in sorted(all_references)],
             'PG': header_dict.get('PG', [])
         }
         
-        # Create reference name mapping
         ref_to_id = {ref: idx for idx, ref in enumerate(sorted(all_references))}
-        
-        # Create temporary merged BAM file
         temp_merged = os.path.join(CUSTOM_TEMP_DIR, f"temp_merged_{uuid.uuid4()}.bam")
         temp_files.append(temp_merged)
         
         with pysam.AlignmentFile(temp_merged, "wb", header=new_header) as outfile:
             for i, bamfile in enumerate(file_handles):
-                # Instead of using fetch, iterate through the file directly
                 for read in bamfile:
-                    # Handle reference IDs correctly
                     if not read.is_unmapped:
                         try:
                             old_ref_name = bamfile.get_reference_name(read.reference_id)
                             read.reference_id = ref_to_id[old_ref_name]
-                            
-                            # Update mate reference if paired
                             if read.is_paired and not read.mate_is_unmapped:
                                 old_mate_ref_name = bamfile.get_reference_name(read.next_reference_id)
                                 read.next_reference_id = ref_to_id[old_mate_ref_name]
@@ -3634,7 +3723,7 @@ def merge_bam_files(files, progress_callback=None):
         sorted_output = os.path.join(CUSTOM_TEMP_DIR, f"sorted_merged_{uuid.uuid4()}.bam")
         temp_files.append(sorted_output)
         
-        # Sort using pysam.sort
+        # Sort bam file
         pysam.sort("-o", sorted_output, temp_merged)
         
         # Index the sorted file
@@ -3739,7 +3828,7 @@ def update_console_log(n):
             last_lines = lines[-200:]  # Adjust if needed
             log_text = ''.join(last_lines)
             
-            # Add classes for different log levels
+            # classes for different log levels
             log_text = log_text.replace('[ERROR]', '<span class="log-error">[ERROR]</span>')
             log_text = log_text.replace('[WARNING]', '<span class="log-warning">[WARNING]</span>')
             log_text = log_text.replace('[INFO]', '<span class="log-info">[INFO]</span>')
@@ -4000,23 +4089,20 @@ def run_mapdamage(n_clicks, selected_bam, selected_ref, store_data):
     if selected_ref is None:
         return html.Div("Please select a reference genome.", className="text-danger"), None
 
-    # Retrieve BAM file path
     bam_file_data = next((f for f in store_data['files'] if f['filename'] == selected_bam), None)
     if bam_file_data is None:
         return html.Div("Selected BAM file not found.", className="text-danger"), None
     bam_path = process_uploaded_file(bam_file_data['content'], bam_file_data['filename'])[0]
 
-    # Retrieve Reference genome path
     ref_file_data = next((f for f in store_data['files'] if f['filename'] == selected_ref), None)
     if ref_file_data is None:
         return html.Div("Selected reference genome not found.", className="text-danger"), None
     ref_path = process_uploaded_file(ref_file_data['content'], ref_file_data['filename'])[0]
 
-    # Output directory
     output_dir = os.path.join(CUSTOM_TEMP_DIR, f"mapdamage_results_{uuid.uuid4()}")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Start the mapDamage2 task
+
     task = run_mapdamage_task.delay(bam_path, ref_path, output_dir)
 
     return html.Div(f"mapDamage2 analysis started. Task ID: {task.id}", className="text-info"), task.id
@@ -4046,13 +4132,13 @@ def toggle_settings(settings_click, apply_click, is_open, centrifuge_db_path):
     else:
         button_id = ctx.triggered[0]['prop_id'].split('.')[0]
         if button_id == 'settings-button':
-            return not is_open  # Toggle the offcanvas
+            return not is_open # open settings
         elif button_id == 'apply-settings-button':
             # Save settings
             config['centrifuge_db_path'] = centrifuge_db_path
             with open('config.yaml', 'w') as f:
                 yaml.dump(config, f)
-            return False  # Close the offcanvas
+            return False  # Close settings offcanvas
     return is_open
 
 
@@ -4075,7 +4161,7 @@ def update_alignment_stats(selected_file, store_data):
 
     stats_text = get_alignment_stats_text(stats)
 
-    # Only include mismatch information if it's available
+    # mismatch info only if it's available
     mismatch_info = []
     if isinstance(stats.get('Mismatch Counts'), dict):  # This ensures it's only for SAM/BAM files
         mismatch_info = [
@@ -4118,7 +4204,6 @@ def parse_and_display_centrifuge_results(report_path):
     except Exception as e:
         return html.Div(f"Error reading Centrifuge report: {e}", className="text-danger")
     
-    # Process the DataFrame as needed
     top_n = 10
     df_top = df.head(top_n)
 
@@ -4277,7 +4362,7 @@ def export_plots(n_clicks, *args):
 )
 def update_ct_checklist(ct_value):
     if len(ct_value) > 1:
-        # Keep only the last selected option
+        # Keep only last selected option
         return [ct_value[-1]]
     return ct_value
 
@@ -4304,7 +4389,7 @@ def update_file_store(contents, filenames, store_data, current_selection):
         store_data = {'files': []}
 
     if contents is None:
-        # Use existing options from store_data
+        # existing options from store_data
         options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files']]
         bam_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] == 'bam']
         ref_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] in ['fasta', 'fa', 'fna']]
@@ -4329,7 +4414,7 @@ def update_file_store(contents, filenames, store_data, current_selection):
     # Populate FASTA file options for reference genome selector
     ref_options = [{'label': f['filename'], 'value': f['filename']} for f in files if f['format'] in ['fasta', 'fa', 'fna']]
 
-    # Automatically select the first file if no file is currently selected
+    # auto select first file
     if current_selection is None and new_file_added:
         current_selection = files[0]['filename']
 
@@ -4341,45 +4426,6 @@ def update_file_store(contents, filenames, store_data, current_selection):
 ###########################################################################################################
 
 ###########################################################################################################
-
-# Trigger BAM load task with a button click
-@app.callback(
-    Output('loading-status', 'children'),
-    Input('load-bam-button', 'n_clicks'),
-    State('uploaded-bam-file', 'data'),
-    prevent_initial_call=True
-)
-def load_bam_file_trigger(n_clicks, uploaded_file_data):
-    if not uploaded_file_data:
-        raise PreventUpdate
-
-    # Assume uploaded_file_data contains a path to the uploaded BAM file
-    task = load_bam_file.apply_async(args=[uploaded_file_data])
-    return html.Div(f"Task ID: {task.id}")
-
-@app.callback(
-    Output('progress-bar', 'value'),
-    Output('progress-percentage', 'children'),
-    Input('interval-component', 'n_intervals'),
-    State('task-id', 'data'),
-    prevent_initial_call=True
-)
-def update_progress(n_intervals, task_id):
-    if not task_id:
-        raise PreventUpdate
-
-    response = requests.get(f'http://localhost:5555/api/task/{task_id}')
-    task_status = response.json()
-    if task_status['state'] == 'PROGRESS':
-        progress = task_status['meta']['progress']
-        return progress, f"{progress:.2f}%"
-    elif task_status['state'] == 'SUCCESS':
-        return 100, "100% (Complete)"
-    elif task_status['state'] == 'FAILURE':
-        return 0, "Task Failed"
-    else:
-        return dash.no_update, dash.no_update
-
 
 @app.callback(
     [
@@ -4405,7 +4451,8 @@ def update_progress(n_intervals, task_id):
         Input('read-length-histogram', 'selectedData'),
         Input('read-length-histogram', 'clickData'),
         Input('clear-selection-button', 'n_clicks'),
-        Input('sequencing-type', 'value')
+        Input('sequencing-type', 'value'),
+        Input('soft-clip-handling', 'value')
     ],
     [
         State('selected-lengths', 'data'),
@@ -4426,10 +4473,10 @@ def update_histograms(
     read_length_clickData, 
     clear_selection_nclicks, 
     sequencing_type,
+    soft_clip_handling,
     current_selected_lengths, 
     current_fig
 ):
-    # Check if no file is selected
     if selected_file is None:
         empty_figure = go.Figure()
         empty_text = ""
@@ -4439,33 +4486,26 @@ def update_histograms(
         )
 
 
-    # Initialize selected_lengths
     selected_lengths = []
-
-    # Handle clear selection
     if clear_selection_nclicks:
         selected_lengths = []
     else:
-        # Handle selection from selectedData or clickData
         selected_lengths = current_selected_lengths or []
         
         if read_length_selectedData and read_length_selectedData["points"]:
             selected_x_values = [point['x'] for point in read_length_selectedData['points']]
-            # Update selected_lengths by intersecting current selection
+            # intersecting current selection
             if selected_lengths:
                 selected_lengths = list(set(selected_lengths).intersection(set(selected_x_values)))
             else:
                 selected_lengths = selected_x_values
         elif read_length_clickData and read_length_clickData["points"]:
-            # Handle clickData (single bar click)
+            # clickData (single bar click) on read length dist
             clicked_length = int(read_length_clickData['points'][0]['x'])
             if clicked_length not in selected_lengths:
                 selected_lengths.append(clicked_length)
 
-    # Convert ct_checklist to tuple
     ct_checklist_tuple = tuple(ct_checklist)
-
-    # Prepare C>T filters
     filter_ct = None
     exclusively_ct = False
     subtract_ct = False
@@ -4477,10 +4517,7 @@ def update_histograms(
         exclusively_ct = True
     if 'subtract_ct' in ct_checklist_tuple:
         subtract_ct = True
-
-    # Convert mapq_range to tuple
     mapq_range_tuple = tuple(mapq_range)
-
     file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
     if file_data is None:
         empty_figure = go.Figure()
@@ -4490,7 +4527,6 @@ def update_histograms(
             empty_figure, empty_figure, empty_text, empty_figure, empty_figure, empty_figure
         )
 
-    # Initialize default empty figures for mismatch-related plots
     empty_mismatch_fig = go.Figure().update_layout(
         title='Mismatch Frequency Not Available for This File Format',
         xaxis=dict(title='', color=colors['muted']),
@@ -4502,13 +4538,11 @@ def update_histograms(
     mismatch_freq_fig = empty_mismatch_fig
     old_mismatch_freq_fig = empty_mismatch_fig
 
-    # Adjust the call to load_and_process_file
     read_lengths, file_format, deduped_file_path = load_and_process_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct,
-        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple, min_base_quality
+        exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple, min_base_quality,
+        soft_clip_option=soft_clip_handling
     )
-
-    # Handle mismatch frequency based on file format
     if file_format in ['bam', 'sam']:
         frequencies = calculate_mismatch_frequency(read_lengths, file_format, sequencing_type)
         if frequencies:
@@ -4519,7 +4553,6 @@ def update_histograms(
 
     bin_centers, hist, bins = prepare_histogram_data(read_lengths)
 
-    # Create read length histogram with uirevision
     read_length_fig = create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins)
 
     overall_cg_content = calculate_overall_cg_content(read_lengths)
@@ -4542,36 +4575,32 @@ def update_histograms(
         )
     )
 
-    # Generate CG Content Histogram based on selected_lengths
+    # CG Content Histogram based on selected_lengths
     cg_contents_for_length = [
         cg for length, cg, _, _, _, _ in read_lengths if length in selected_lengths
     ]
     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
 
-    # Generate Damage Patterns Figure
+    # Damage Patterns Figure
     five_prime_end, three_prime_end = get_damage_patterns(deduped_file_path, file_format, filter_ct=filter_ct)
     damage_fig = create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
 
     mapq_scores = [mapq for _, _, _, _, _, mapq in read_lengths if mapq is not None]
-    # Create MAPQ histogram
+    # MAPQ histogram
     mapq_fig = create_mapq_histogram(mapq_scores)
 
-    # Calculate alignment stats
+    # alignment stats
     temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
     stats = calculate_alignment_stats(temp_file_path, file_format)
 
-    # Initialize empty figures for mismatch type and damage pattern
     mismatch_type_fig = go.Figure()
     damage_pattern_fig = go.Figure()
-
-    # Set filters to mismatches
     if stats.get('Mismatch Details') != 'N/A':
         filtered_mismatches = filter_mismatches(
             stats['Mismatch Details'],
             min_base_quality=min_base_quality,
             min_mapping_quality=mapq_range[0]
         )
-        # Recalculate mismatch counts
         filtered_mismatch_counts = {}
         for mismatch in filtered_mismatches:
             key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
@@ -4581,7 +4610,7 @@ def update_histograms(
         mismatch_type_fig = create_mismatch_type_bar_chart(filtered_mismatch_counts)
         damage_pattern_fig = create_damage_pattern_plot(filtered_mismatches)
 
-    # Data summary after generating all plots
+    # Data summary 
     read_length_text = get_read_length_data(read_lengths)
     cg_content_text = get_overall_cg_content_data(read_lengths)
     damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
@@ -4614,7 +4643,6 @@ def update_histograms(
         stats_text
     )
 
-    # Return updated figures and data
     return (
         read_length_fig, overall_cg_fig, cg_content_fig, damage_fig,
         selected_lengths, mismatch_freq_fig, data_summary_text, mapq_fig,
@@ -4641,11 +4669,12 @@ def update_histograms(
         State('ct-count-dropdown', 'value'),
         State('mapq-range', 'value'),
         State('selected-lengths', 'data'),
+        State('soft-clip-handling', 'value')
     ],
     prevent_initial_call=True
 )
 def export_reads(
-    n_clicks, selected_file, store_data, selected_nm, ct_checklist, ct_count_value, mapq_range, selected_lengths
+    n_clicks, selected_file, store_data, selected_nm, ct_checklist, ct_count_value, mapq_range, selected_lengths, soft_clip_option
 ):
     if n_clicks is None or n_clicks == 0:
         raise dash.exceptions.PreventUpdate
@@ -4697,7 +4726,7 @@ def export_reads(
     # Export the selected reads with filters applied
     export_selected_reads(
         read_lengths, selected_lengths, selected_cg_content, output_file_path,
-        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes,
+        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes, soft_clip_option=soft_clip_option
     )
 
     return dcc.send_file(output_file_path)
@@ -4728,7 +4757,6 @@ def export_reads(
 ##########################################################################################################
 
 if __name__ == '__main__':
-    # Define the path for your log file
     log_file_path = os.path.join(os.path.dirname(__file__), 'celery.log')
 
     def log_to_file(process, log_file_path):
@@ -4741,8 +4769,13 @@ if __name__ == '__main__':
                     log_file.write(output)
                     log_file.flush()
 
-    # Launch the Celery worker
+    # start Celery worker
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        # Set up the environment to include the project root in PYTHONPATH, otherwise might lead to some issues with celery
+        env = os.environ.copy()
+        project_root = os.path.abspath(os.path.dirname(__file__))
+        env['PYTHONPATH'] = os.pathsep.join([env.get('PYTHONPATH', ''), project_root])
+
         worker_process = subprocess.Popen(
             [
                 sys.executable, '-m', 'celery', '-A', 'utils.tasks.celery_app', 'worker',
@@ -4751,10 +4784,10 @@ if __name__ == '__main__':
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
-            universal_newlines=True
+            universal_newlines=True,
+            env=env  
         )
-
-        # Start a thread to log output to a file
+        # new thread for log output
         log_thread = threading.Thread(target=log_to_file, args=(worker_process, log_file_path))
         log_thread.daemon = True
         log_thread.start()
