@@ -108,32 +108,6 @@ The setup creates the following permission structure:
 * Batch processing capabilities
 * Automatic quality control
 
-### Advanced Features
-
-* Centrifuge taxonomic classification (optional)
-* mapDamage2 integration for PMD assessment
-* Interactive filtering based on damage patterns
-
-### Simulation Module
-
-#### Fragment Length Distribution
-* Log-normal distribution
-* Mean length: 20-500 bp
-* Standard deviation: 0.1-2.0
-* Minimum/maximum length constraints
-
-#### Damage Pattern Configuration
-* 5' terminal deamination rate (0-100%)
-* 3' terminal deamination rate (0-100%)
-* Temperature factor (0.5-2.0)
-* Single/double-stranded damage pattern selection
-
-#### Strand Parameters
-* Strand bias: 0-100%
-* Reference genome length: 10kb-10Mb
-* Strand-specific damage application
-
-
 ## Configuration
 
 Edit `config.yaml` to set:
