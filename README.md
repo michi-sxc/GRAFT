@@ -1,5 +1,12 @@
 # GRAFT - Genomic Read Analysis and Filtering Tool
 
+[![GitHub last commit](https://img.shields.io/github/last-commit/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/commits/main)
+[![GitHub issues](https://img.shields.io/github/issues/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/issues)
+[![License](https://img.shields.io/github/license/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/blob/main/LICENSE)
+[![Maintenance](https://img.shields.io/badge/maintenance-inactive-red.svg)](https://github.com/michi-sxc/GRAFT)
+[![Repo Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](https://github.com/michi-sxc/GRAFT)
+
+
 ## Overview
 
 GRAFT is a Python-based toolkit for analyzing ancient DNA data through an interactive web interface. The application integrates sequence data visualization, quality assessment, and filtering capabilities specific to degraded DNA analysis. Built on Dash and Plotly, GRAFT processes BAM, SAM, FASTA, and FASTQ files.
