@@ -11,7 +11,6 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
 * C>T transition pattern assessment
 * MAPQ-based filtering system
 * Cross-format file conversion
-* Integrated taxonomic classification
 * Post-mortem damage modeling
 
 ## Technical Requirements
