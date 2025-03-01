@@ -41,10 +41,9 @@ class CommandExecutor:
 
 class SystemDependencyInstaller:
     """Handles system-specific dependency installation"""
-    
+
     @staticmethod
     def install_homebrew():
-        """Install Homebrew on MacOS if not present"""
         try:
             CommandExecutor.run_command(['brew', '--version'], check=False)
         except FileNotFoundError:
@@ -54,44 +53,77 @@ class SystemDependencyInstaller:
 
     @staticmethod
     def install_linux_deps():
-        """Install dependencies on Linux"""
-        deps = [
-            'build-essential',
-            'gcc',
-            'python3-dev',
-            'zlib1g-dev',
-            'liblzma-dev',
-            'libzstd-dev'
-        ]
-        
-        CommandExecutor.run_command(['sudo', 'apt-get', 'update'])
-        CommandExecutor.run_command(['sudo', 'apt-get', 'install', '-y'] + deps)
+        deps = {
+            "apt-get": [
+                "build-essential",
+                "gcc",
+                "python3-dev",
+                "zlib1g-dev",
+                "liblzma-dev",
+                "libzstd-dev"
+            ],
+            "yum": [
+                "gcc",
+                "python3-devel",
+                "zlib-devel",
+                "xz-devel",
+                "zstd-devel",
+                "make"
+            ],
+            "dnf": [
+                "gcc",
+                "python3-devel",
+                "zlib-devel",
+                "xz-devel",
+                "zstd-devel",
+                "make"
+            ],
+            "pacman": [
+                "base-devel",
+                "gcc",
+                "python",
+                "zlib",
+                "xz",
+                "zstd"
+            ]
+        }
+        pkg_manager_found = False
+        for manager, packages in deps.items():
+            if shutil.which(manager):
+                SetupLogger.log(f"Using {manager} for dependency installation.")
+                pkg_manager_found = True
+                if manager == "apt-get":
+                    CommandExecutor.run_command(["sudo", manager, "update"])
+                    CommandExecutor.run_command(["sudo", manager, "install", "-y"] + packages)
+                elif manager in ["yum", "dnf"]:
+                    CommandExecutor.run_command(["sudo", manager, "install", "-y"] + packages)
+                elif manager == "pacman":
+                    CommandExecutor.run_command(["sudo", manager, "-Syu", "--noconfirm"])
+                    CommandExecutor.run_command(["sudo", manager, "-S", "--noconfirm"] + packages)
+                break
+        if not pkg_manager_found:
+            SetupLogger.log("No supported package manager found on Linux system", "ERROR")
+            sys.exit(1)
 
     @staticmethod
     def install_macos_deps():
-        """Install dependencies on MacOS"""
         deps = [
-            'gcc',
-            'python',
-            'zlib',
-            'xz',
-            'zstd'
+            "gcc",
+            "python",
+            "zlib",
+            "xz",
+            "zstd"
         ]
-        
-        # Install Xcode Command Line Tools if needed
         try:
-            CommandExecutor.run_command(['xcode-select', '--version'], check=False)
+            CommandExecutor.run_command(["xcode-select", "--version"], check=False)
         except FileNotFoundError:
             SetupLogger.log("Installing Xcode Command Line Tools...")
-            CommandExecutor.run_command(['xcode-select', '--install'])
-
-        # Install Homebrew if needed
+            CommandExecutor.run_command(["xcode-select", "--install"])
         SystemDependencyInstaller.install_homebrew()
-        
-        # Update Homebrew and install dependencies
-        CommandExecutor.run_command(['brew', 'update'])
+        CommandExecutor.run_command(["brew", "update"])
         for dep in deps:
-            CommandExecutor.run_command(['brew', 'install', dep])
+            CommandExecutor.run_command(["brew", "install", dep])
+
 
 class DependencyInstaller:
     """Handles installation of Python packages and DUST module"""
