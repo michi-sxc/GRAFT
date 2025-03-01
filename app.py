@@ -1,6 +1,5 @@
 import shutil
 import pysam
-import sys
 import threading
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -13,36 +12,28 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from dash_iconify import DashIconify
 from dash.dependencies import ALL, MATCH
+from flask import Flask
 import json
-from plotly.subplots import make_subplots
 import dash_dangerously_set_inner_html
 import plotly.graph_objects as go
-import plotly.express as px
 import plotly.colors
 import plotly.io as pio
 import pandas as pd
 import base64
-import tempfile
 import uuid
-import subprocess
 from functools import lru_cache
-from celery import Celery
 from concurrent.futures import ThreadPoolExecutor
 import yaml
 import zipfile
-from ansi2html import Ansi2HTMLConverter
-from itertools import islice
-import re
 import dust_module
 import threading
 import queue
-import time
 import datetime
-import requests
+import plotly.graph_objects as go
+import uuid
+import tempfile
+import re
 
-
-from utils.tasks import celery_app, run_mapdamage_task, run_centrifuge_task, load_bam_file
-from pages import simulation
 from utils.files import TempDirectoryManager
 
 ###############################################################################################
@@ -63,9 +54,17 @@ try:
 except FileNotFoundError:
     config = {}
 
-default_centrifuge_db_path = config.get('centrifuge_db_path', '')
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SOLAR, "/assets/custom.css"], suppress_callback_exceptions=True) # general dash theme, can be changed but colors need to be adjusted accordingly (if you want a pretty dashboard)
+# Create Flask server with extended timeout
+server = Flask(__name__)
+server.config['PERMANENT_SESSION_LIFETIME'] = 3600  # Increase session timeout (seconds)
+
+app = dash.Dash(
+    __name__,
+    server=server,  # Pass the custom Flask server
+    external_stylesheets=[dbc.themes.SOLAR, "/assets/custom.css"],
+    suppress_callback_exceptions=True,
+)
 
 
 # custom temp directory for storing the data (needs better implementation, but works fine)
@@ -107,27 +106,53 @@ colors = {
 
 #################################################################
 
+def count_bam_reads(bam_path):
+    """
+    Count total reads in a BAM file safely, with or without index
+    
+    Parameters:
+    -----------
+    bam_path : str
+        Path to BAM file
+    
+    Returns:
+    --------
+    int
+        Total number of reads
+    """
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bamfile:
+        try:
+            # First attempt: use count if index exists
+            total_reads = bamfile.count()
+            return total_reads
+        except ValueError:
+            # No index - count manually using iteration
+            total_reads = sum(1 for _ in bamfile)
+            return total_reads
+
 def rgb_to_hex(rgb):
     """Convert an RGB tuple to a hex string, rounding the values to integers - small unnecessary helper function"""
     return '#{:02x}{:02x}{:02x}'.format(int(round(rgb[0])), int(round(rgb[1])), int(round(rgb[2])))
 
 def prepare_histogram_data(read_lengths):
+    """
+    Prepare histogram data from read lengths.
+    Modified to handle simulation format data.
+    """
     if not read_lengths:
         return np.array([]), np.array([]), np.array([])
 
+    # Extract lengths from read_lengths tuples
     lengths = [length for length, _, _, _, _, _ in read_lengths]
-    min_length = min(lengths)
-    max_length = max(lengths)
     
-    # Handle case where all reads have same length
-    if min_length == max_length:
-        bins = np.array([min_length - 0.5, min_length + 0.5])
-        hist, bin_edges = np.histogram(lengths, bins=bins)
-        bin_centers = np.array([min_length])
-    else:
-        bins = np.arange(min_length, max_length + 1, 1)
-        hist, bin_edges = np.histogram(lengths, bins=bins)
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    # Create bins with a step size of 1
+    min_len = min(lengths)
+    max_len = max(lengths)
+    bins = np.arange(min_len - 0.5, max_len + 1.5, 1)  # Add 0.5 padding on each end
+    
+    # Calculate histogram
+    hist, bin_edges = np.histogram(lengths, bins=bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     
     return bin_centers, hist, bins
 
@@ -276,7 +301,33 @@ def extract_mismatches(read):
 
     return mismatches
 
-
+def get_base_style(read_base, ref_base, is_softclipped, is_reverse, softclip_display):
+    """Helper function to determine base styling"""
+    base_color = "lightblue"  # default color for matched bases
+    
+    if is_softclipped:
+        if softclip_display == 'highlight':
+            return f'<span style="color: gray; background-color: #444444; padding: 0 2px;">{read_base}</span>'
+        else:
+            return f'<span style="color: gray;">{read_base}</span>'
+            
+    if ref_base is not None:
+        read_base_upper = read_base.upper()
+        ref_base_upper = ref_base.upper()
+        
+        if read_base_upper != ref_base_upper:
+            if is_reverse:
+                if ref_base_upper == 'G' and read_base_upper == 'A':
+                    base_color = "orange"
+                else:
+                    base_color = "red"
+            else:
+                if ref_base_upper == 'C' and read_base_upper == 'T':
+                    base_color = "orange"
+                else:
+                    base_color = "red"
+    
+    return f'<span style="color: {base_color};">{read_base}</span>'
 
 
 ################################
@@ -316,9 +367,10 @@ class FileMerger:
         if not files:
             return False, "No files selected for merging."
         
-        
+        # Get first file's format
         base_format = files[0]['format']
         
+        # Define compatible formats
         compatible_formats = {
             'bam': ['bam'],
             'sam': ['sam'],
@@ -334,24 +386,41 @@ class FileMerger:
         return True, "Files validated successfully."
 
     def process_chunk(self, chunk, format_type):
-        """Process a chunk of reads with progress tracking"""
+        """Process a chunk of reads with progress tracking."""
         processed_chunk = []
-        
         for read in chunk:
             if self._stop_event.is_set():
                 break
-                
-            if format_type in ['bam', 'sam']:
-                length = len(read.query_sequence) if read.query_sequence else 0
-                cg_content = calculate_cg_content(read.query_sequence) if read.query_sequence else 0
-                nm_tag = read.get_tag('NM') if read.has_tag('NM') else None
-                processed_chunk.append((length, cg_content, nm_tag, read.query_sequence, read, read.mapping_quality))
+
+            # Get the sequence from query_sequence if available; otherwise, use sequence
+            if hasattr(read, 'query_sequence') and read.query_sequence:
+                seq = read.query_sequence
+            elif hasattr(read, 'sequence') and read.sequence:
+                seq = read.sequence
             else:
-                length = len(str(read.seq))
-                cg_content = calculate_cg_content(str(read.seq))
-                processed_chunk.append((length, cg_content, None, str(read.seq), read, None))
-                
+                seq = ""
+            if format_type in ['bam', 'sam']:
+                length = len(seq)
+                cg_content = calculate_cg_content(seq)
+                # Use get_tag if available (for pysam) – ProcessedRead objects may not have this method
+                if hasattr(read, 'get_tag') and read.has_tag('NM'):
+                    nm_tag = read.get_tag('NM')
+                else:
+                    nm_tag = None
+                processed_chunk.append((length, cg_content, nm_tag, seq, read, read.mapping_quality))
+            else:
+                # For FASTA/FASTQ, use record.seq if available; otherwise use sequence
+                if hasattr(read, 'seq'):
+                    seq_str = str(read.seq)
+                elif hasattr(read, 'sequence'):
+                    seq_str = str(read.sequence)
+                else:
+                    seq_str = ""
+                length = len(seq_str)
+                cg_content = calculate_cg_content(seq_str)
+                processed_chunk.append((length, cg_content, None, seq_str, read, None))
         return processed_chunk
+
 
     def merge_files(self, files, progress_callback=None, chunk_size=1000):
         """
@@ -378,7 +447,7 @@ class FileMerger:
         
         # First pass: count total reads
         for file_data in files:
-            temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+            temp_file_path, _ = parse_uploaded_file(file_data['content'], file_data['filename'])
             if format_type in ['bam', 'sam']:
                 with pysam.AlignmentFile(temp_file_path, "rb" if format_type == 'bam' else 'r') as f:
                     total_reads += sum(1 for _ in f)
@@ -392,7 +461,7 @@ class FileMerger:
                 if self._stop_event.is_set():
                     break
                     
-                temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+                temp_file_path, _ = parse_uploaded_file(file_data['content'], file_data['filename'])
                 
                 if format_type in ['bam', 'sam']:
                     with pysam.AlignmentFile(temp_file_path, "rb" if format_type == 'bam' else 'r') as f:
@@ -442,12 +511,12 @@ class FileMerger:
         """Stop the file processing"""
         self._stop_event.set()
 
-def process_uploaded_file(content, filename):
+def parse_uploaded_file(content, filename):
     file_ext = filename.split('.')[-1].lower()
     if file_ext not in ['bam', 'sam', 'fasta', 'fq', 'fna', 'fa', 'fastq']:
         raise ValueError(f"Unsupported file format: {file_ext}")
 
-    # file extensions to Bio.SeqIO format names
+    # Map file extensions to Bio.SeqIO format names
     if file_ext in ['fa', 'fna', 'fasta']:
         file_format = 'fasta'
     elif file_ext in ['fq', 'fastq']:
@@ -457,11 +526,16 @@ def process_uploaded_file(content, filename):
     else:
         raise ValueError(f"Unsupported file extension: {file_ext}")
 
+    
     content_type, content_string = content.split(',') 
+
+    # Decode the base64-encoded string
     decoded = base64.b64decode(content_string)
+
     unique_filename = f"{uuid.uuid4()}_{filename}"
     temp_file_path = os.path.join(CUSTOM_TEMP_DIR, unique_filename)
 
+    # Write the decoded content to a temporary file
     with open(temp_file_path, "wb") as fp:
         fp.write(decoded)
 
@@ -541,13 +615,14 @@ def export_selected_reads(
 
 
 
-# cached results of file-processing to avoid reloading the data, but not strictly necessary, you won't hit the cache size limit
+# cached results of file-processing to avoid reloading the data, but not strictly necessary
 @lru_cache(maxsize=100)
-def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range, min_base_quality=None, soft_clip_option='show'):
+def load_file(file_content, filename, selected_nm, filter_ct, exclusively_ct, ct_count_value, 
+              ct_checklist_tuple, mapq_range, min_base_quality=None, soft_clip_option='show'):
     """
     Load and process file with error handling.
     """
-    temp_file_path, file_format = process_uploaded_file(file_content, filename)
+    temp_file_path, file_format = parse_uploaded_file(file_content, filename)
     deduped_file_path = os.path.join(
         CUSTOM_TEMP_DIR, f"deduped_{uuid.uuid4()}_{filename}"
     )
@@ -619,7 +694,7 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
                 read_lengths = [r for r in read_lengths if r[2] == selected_nm]
 
             # Deduplicate reads after filtering
-            read_lengths = remove_duplicates_with_strand_check(temp_file_path, deduped_file_path, file_format, soft_clip_option=soft_clip_option, reads=read_lengths)
+            read_lengths = read_quality_control(temp_file_path, deduped_file_path, file_format, soft_clip_option=soft_clip_option, reads=read_lengths)
 
         else:  # Handle FASTQ/FASTA files
             read_lengths = []
@@ -638,8 +713,10 @@ def load_and_process_file(file_content, filename, selected_nm, filter_ct, exclus
         return [], file_format, deduped_file_path
 
     return read_lengths, file_format, deduped_file_path
-    
-def remove_duplicates_with_strand_check(input_file, output_file, file_format, reads, apply_dust=False, soft_clip_option='show'):
+
+
+
+def read_quality_control(input_file, output_file, file_format, reads, apply_dust=False, soft_clip_option='show'):
     if file_format in ['bam', 'sam']:
         bamfile = pysam.AlignmentFile(input_file, "rb" if file_format == 'bam' else "r", check_sq=False)
         outputfile = pysam.AlignmentFile(output_file, "wb" if file_format == 'bam' else 'w', header=bamfile.header)
@@ -705,39 +782,121 @@ def remove_duplicates_with_strand_check(input_file, output_file, file_format, re
 #####################################################################
 
 def get_mismatches(read):
+    """
+    Extract mismatches from a read using the MD tag and CIGAR string.
+    This version supports ProcessedRead objects produced by Rust.
+    If an md_tag is present, it is used to determine the reference bases.
+    Returns a list of dictionaries with keys:
+      'read_pos', 'ref_pos', 'read_base', 'ref_base',
+      'base_quality', 'mapping_quality', and 'is_reverse'.
+    """
     mismatches = []
-
-    if read.is_unmapped:
+    
+    # Get the read sequence
+    if hasattr(read, 'query_sequence') and read.query_sequence:
+        read_seq = read.query_sequence.upper()
+    elif hasattr(read, 'sequence') and read.sequence:
+        read_seq = read.sequence.upper()
+    else:
         return mismatches
 
-    read_seq = read.query_sequence.upper()
-    qual = read.query_qualities
-    if qual is None:
-        qual = [0] * len(read_seq)  # Assign zero quality if not available
+    # Get quality scores
+    if hasattr(read, 'query_qualities') and read.query_qualities is not None:
+        qual = read.query_qualities
+    elif hasattr(read, 'base_qualities') and read.base_qualities is not None:
+        qual = read.base_qualities
+    else:
+        qual = [0] * len(read_seq)
 
-    ref_seq = read.get_reference_sequence().upper()
+    # If an MD tag is available, use it to determine mismatches.
+    if hasattr(read, 'md_tag') and read.md_tag:
+        md_string = read.md_tag
+        seq_pos = 0
+        # The MD tag is parsed into tokens: numbers (matching bases), deletions (prefixed with '^'),
+        # or a single letter (mismatch)
+        md_tokens = re.findall(r'(\d+|\^[A-Z]+|[A-Z])', md_string)
+        for token in md_tokens:
+            if token.isdigit():
+                seq_pos += int(token)
+            elif token.startswith('^'):
+                # A deletion in the reference; MD tag does not consume a base from the read.
+                continue
+            else:
+                # token is a single letter indicating a mismatch in the reference.
+                if seq_pos < len(read_seq):
+                    read_base = read_seq[seq_pos]
+                    ref_base = token.upper()
+                    # Only record the mismatch if the read base actually differs.
+                    if read_base != ref_base:
+                        mismatch = {
+                            'read_pos': seq_pos,
+                            # Without a full coordinate, we approximate ref_pos as seq_pos.
+                            'ref_pos': seq_pos,
+                            'read_base': read_base,
+                            'ref_base': ref_base,
+                            'base_quality': qual[seq_pos] if seq_pos < len(qual) else 0,
+                            'mapping_quality': getattr(read, 'mapping_quality', 0),
+                            'is_reverse': getattr(read, 'is_reverse', False)
+                        }
+                        mismatches.append(mismatch)
+                seq_pos += 1
+        return mismatches
 
-    for q_pos, r_pos in read.get_aligned_pairs(matches_only=True):
-        read_base = read_seq[q_pos]
-        ref_base = ref_seq[r_pos - read.reference_start]
-        base_qual = qual[q_pos]
-        mapping_qual = read.mapping_quality
-        is_reverse = read.is_reverse
+    # Fallback: if no MD tag, try to get a reference sequence.
+    if hasattr(read, 'get_reference_sequence'):
+        ref_seq = read.get_reference_sequence().upper()
+    else:
+        # As a fallback, use the read sequence (which yields no mismatches)
+        ref_seq = read_seq
 
-        if read_base != ref_base:
-            mismatch_info = {
-                'read_pos': q_pos,
-                'ref_pos': r_pos,
-                'read_base': read_base,
-                'ref_base': ref_base,
-                'base_quality': base_qual,
-                'mapping_quality': mapping_qual,
-                'is_reverse': is_reverse
-            }
-            mismatches.append(mismatch_info)
+    ref_start = getattr(read, 'reference_start', 0)
+    try:
+        aligned_pairs = read.get_aligned_pairs(matches_only=True)
+    except TypeError:
+        aligned_pairs = read.get_aligned_pairs(True)
 
+    for pair in aligned_pairs:
+        if isinstance(pair, tuple):
+            if len(pair) == 3:
+                q_pos, r_pos, maybe_ref = pair
+            elif len(pair) == 2:
+                q_pos, r_pos = pair
+                maybe_ref = None
+            else:
+                continue
+
+            if q_pos is None or r_pos is None:
+                continue
+            if q_pos >= len(read_seq):
+                continue
+
+            read_base = read_seq[q_pos]
+            if maybe_ref is not None:
+                ref_base = maybe_ref.upper()
+            elif ref_seq:
+                offset = r_pos - ref_start
+                if offset < 0 or offset >= len(ref_seq):
+                    continue
+                ref_base = ref_seq[offset]
+            else:
+                continue
+
+            base_qual = qual[q_pos] if q_pos < len(qual) else 0
+            mapping_qual = getattr(read, 'mapping_quality', 0)
+            is_reverse = getattr(read, 'is_reverse', False)
+
+            if read_base != ref_base:
+                mismatch = {
+                    'read_pos': q_pos,
+                    'ref_pos': r_pos,
+                    'read_base': read_base,
+                    'ref_base': ref_base,
+                    'base_quality': base_qual,
+                    'mapping_quality': mapping_qual,
+                    'is_reverse': is_reverse
+                }
+                mismatches.append(mismatch)
     return mismatches
-
 
 
 def calculate_alignment_stats(file_path, file_format):
@@ -764,7 +923,7 @@ def calculate_alignment_stats(file_path, file_format):
                     key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
                     mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
 
-            # PCR or optical duplicates
+            # Check for PCR or optical duplicates
             if read.is_duplicate or (read.flag & 1024):  # 1024 is BAM_FDUP flag
                 duplicate_reads += 1
         
@@ -824,7 +983,7 @@ def filter_mismatches(mismatches, min_base_quality=20, min_mapping_quality=0):
 
 def has_only_ct_mismatches(read):
     if read.is_unmapped:
-        return False
+        return False  # Unmapped reads cannot be considered
 
     mismatches = []
     for q_pos, r_pos, ref_base in read.get_aligned_pairs(with_seq=True):
@@ -850,8 +1009,6 @@ def has_only_ct_mismatches(read):
                 return False
 
     return True  # All mismatches are C>T or G>A
-
-
 
 
 def categorize_mismatches(mismatches): # have to check whether this makes sense
@@ -914,342 +1071,7 @@ def calculate_cg_content(sequence):
     cg_count = sequence.count('C') + sequence.count('G')
     return cg_count / len(sequence)
 
-def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins):
-    read_length_fig = go.Figure()
 
-    # Histogram bars
-    read_length_fig.add_trace(go.Bar(
-        x=bin_centers - 0.5,
-        y=hist,
-        name=f'{selected_file} Read Count',
-        opacity=1,
-        hovertemplate='%{x}: %{y}<extra></extra>',
-        marker_color=colors['line'],
-    ))
-
-    
-    mean_cg_content = calculate_mean_cg_content(read_lengths, bins)
-
-    # CG content markers
-    read_length_fig.add_trace(go.Scatter(
-        x=[x - 0.5 for x in bin_centers],
-        y=mean_cg_content,
-        name=f'{selected_file} Average CG Content',
-        yaxis='y2',
-        mode='markers',
-        marker=dict(color=colors['highlight'], size=8),
-    ))
-
-    # Lines between neighboring bins
-    for i in range(len(bin_centers) - 1):
-        if mean_cg_content[i] > 0 and mean_cg_content[i + 1] > 0:
-            read_length_fig.add_trace(go.Scatter(
-                x=[bin_centers[i] - 0.5, bin_centers[i + 1] - 0.5],
-                y=[mean_cg_content[i], mean_cg_content[i + 1]],
-                mode='lines',
-                line=dict(color=colors['highlight'], width=2),
-                yaxis='y2',
-                showlegend=False
-            ))
-
-    read_length_fig.update_layout(
-        title=dict(text='Read Length Distribution with Average CG Content', font=dict(color=colors['muted'])),
-        uirevision='read_length',
-        xaxis=dict(title='Read Length', color=colors['muted'], tickfont=dict(color=colors['muted'])),
-        yaxis=dict(
-            title=dict(text='Read Count', font=dict(color='#1CA8FF')),
-            showline=True,
-            linecolor='#1CA8FF',
-            tickfont=dict(color=colors['muted']),
-            gridcolor=colors['grid'],
-            gridwidth=1
-        ),
-        yaxis2=dict(
-            title=dict(text='Average CG Content', font=dict(color='#FF4081')),
-            overlaying='y',
-            side='right',
-            range=[0, 1],
-            fixedrange=True,
-            showline=True,
-            linecolor='#FF4081',
-            tickfont=dict(color=colors['muted']),
-            gridcolor=colors['grid'],
-            gridwidth=1
-        ),
-        legend=dict(x=0.85, y=1.15, font=dict(color=colors['muted'])),
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        dragmode='select',
-        selectdirection='h',
-        newselection_line_width=2,
-        newselection_line_color=colors['secondary'],
-        newselection_line_dash='dashdot',
-        modebar=dict(
-            add=['downloadSVG'],
-            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-        )
-    )
-
-    return read_length_fig
-
-def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
-    cg_content_fig = go.Figure()
-
-    if cg_contents_for_length:
-        cg_content_fig.add_trace(go.Histogram(
-            x=cg_contents_for_length,
-            nbinsx=20,
-            marker_color=colors['marker']
-        ))
-        selected_lengths_str = ', '.join(map(str, selected_lengths)) if selected_lengths else 'All'
-        cg_content_fig.update_layout(
-            title=f'CG Content Distribution for Selected Read Length(s): {selected_lengths_str}',
-            xaxis=dict(title='CG Content', color=colors['muted']),
-            yaxis=dict(title='Frequency', color=colors['muted']),
-            paper_bgcolor=colors['plot_bg'],
-            plot_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted']),
-            dragmode='select',
-            newselection_line_width=2,
-            newselection_line_color=colors['secondary'],
-            newselection_line_dash='dashdot',
-            modebar=dict(
-                add=['downloadSVG'],
-                remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-            )
-        )
-    else:
-        cg_content_fig.update_layout(
-            title='No data available for selected read length(s)',
-            paper_bgcolor=colors['plot_bg'],
-            plot_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
-
-    return cg_content_fig
-
-def create_mismatch_type_bar_chart(mismatch_counts):
-    # Sort mismatches (just for consistent visualization)
-    sorted_mismatches = sorted(mismatch_counts.items(), key=lambda x: (x[0][0], x[0][2]))
-    mutations = [m[0] for m in sorted_mismatches]
-    counts = [m[1] for m in sorted_mismatches]
-    
-    fig = go.Figure(data=[
-        go.Bar(
-            x=mutations,
-            y=counts,
-            marker_color=colors['highlight'],
-            text=counts,
-            textposition='auto',
-        )
-    ])
-    
-    fig.update_layout(
-        title='Mismatch Types Distribution',
-        xaxis=dict(
-            title='Mismatch Type',
-            tickangle=45,
-            color=colors['muted']
-        ),
-        yaxis=dict(
-            title='Count',
-            color=colors['muted']
-        ),
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted']),
-        showlegend=False,
-        bargap=0.2,
-        modebar=dict(
-            add=['downloadSVG'],
-            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-        )
-    )
-    return fig
-
-def create_damage_pattern_plot(mismatches):
-    """
-    Create a 2D heatmap showing damage patterns along read positions
-    """
-    if not mismatches:
-        fig = go.Figure()
-        fig.update_layout(
-            title='No mismatches found in data',
-            paper_bgcolor=colors['plot_bg'],
-            plot_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
-        return fig
-        
-    max_pos = max([m['read_pos'] for m in mismatches]) + 1
-    
-    damage_counts = {
-        'C>T': np.zeros(max_pos),
-        'G>A': np.zeros(max_pos),
-        'Other': np.zeros(max_pos),
-    }
-    total_bases = np.zeros(max_pos)
-    
-    for mismatch in mismatches:
-        pos = mismatch['read_pos']
-        ref_base = mismatch['ref_base']
-        read_base = mismatch['read_base']
-        
-        if ref_base == 'C' and read_base == 'T':
-            damage_counts['C>T'][pos] += 1
-        elif ref_base == 'G' and read_base == 'A':
-            damage_counts['G>A'][pos] += 1
-        else:
-            damage_counts['Other'][pos] += 1
-        total_bases[pos] += 1
-    
-    # Create z-values for heatmap (frequencies)
-    z_values = []
-    text_values = [] 
-    damage_types = ['C>T', 'G>A', 'Other']
-    
-    for damage_type in damage_types:
-        frequencies = np.divide(
-            damage_counts[damage_type],
-            np.maximum(total_bases, 1),
-            out=np.zeros_like(damage_counts[damage_type], dtype=float),
-            where=total_bases != 0
-        )
-        z_values.append(frequencies)
-        text_values.append([
-            f'Count: {int(damage_counts[damage_type][i])}<br>'
-            f'Total bases: {int(total_bases[i])}'
-            for i in range(max_pos)
-        ])
-    
-    # heatmap
-    fig = go.Figure(data=go.Heatmap(
-        z=z_values,
-        y=damage_types,
-        x=list(range(max_pos)),
-        colorscale='Viridis',
-        showscale=True,
-        text=text_values,
-        hovertemplate=(
-            'Position: %{x}<br>'
-            'Type: %{y}<br>'
-            'Frequency: %{z:.4f}<br>'
-            '%{text}<extra></extra>'
-        )
-    ))
-    
-    # Update layout
-    fig.update_layout(
-        title='Damage Pattern Distribution Along Read Length',
-        xaxis=dict(
-            title='Read Position',
-            color=colors['muted'],
-            dtick=5,  # Show every 5th position
-            showgrid=True,
-            gridcolor=colors['grid']
-        ),
-        yaxis=dict(
-            title='Damage Type',
-            color=colors['muted'],
-            showgrid=True,
-            gridcolor=colors['grid']
-        ),
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted']),
-        height=400,
-        margin=dict(l=80, r=20, t=40, b=40),
-        modebar=dict(
-            add=['downloadSVG'],
-            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-        )
-    )
-    
-    return fig
-
-
-def create_detailed_mismatch_pie_chart(stats):
-    mismatch_counts = stats.get('Mismatch Counts')
-    
-    # for everything that has no mismatches 
-    if mismatch_counts == 'N/A' or not mismatch_counts:
-        return go.Figure().update_layout(
-            title_text="No mismatch data available",
-            paper_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
-    sorted_keys = sorted(mismatch_counts.keys(), key=lambda x: (x[0], x[2]))  # Sort by base
-    
-    # The rest of the function (plotting) is way too complex for a pretty visualization
-    # Define color ramps for each base using Plotly colors
-    color_map = {
-        'A': plotly.colors.sequential.Blues,
-        'C': plotly.colors.sequential.Oranges,
-        'G': plotly.colors.sequential.Greens,
-        'T': plotly.colors.sequential.Reds_r,
-        'N': plotly.colors.sequential.solar # otherwise not really visible
-    }
-    
-    # Assign colors to each mismatch type
-    colors_list = []
-    brighter_colors = []
-    for key in sorted_keys:
-        base = key[0]
-        ramp_length = len(color_map[base])
-        color_index = sorted_keys.index(key) % ramp_length
-        color = color_map[base][color_index]
-        colors_list.append(color)
-        
-        # color to RGB tuple
-        if color.startswith('#'):
-            rgb_color = plotly.colors.hex_to_rgb(color)
-        elif color.startswith('rgb'):
-            rgb_color = tuple(map(int, color[4:-1].split(',')))
-        else:
-            raise ValueError(f"Unsupported color format: {color}")
-        
-        # Intermediate color between white and the original color
-        brightened_color = plotly.colors.find_intermediate_color((255, 255, 255), rgb_color, 0.6)
-        brightened_color_hex = rgb_to_hex(brightened_color)
-        brighter_colors.append(brightened_color_hex)
-    
-    labels = sorted_keys
-    values = [mismatch_counts[key] for key in sorted_keys]
-    
-    texttemplate = [
-        f'<span style="color:{brighter_colors[i]}">%{{label}}: %{{percent}}</span>' 
-        for i in range(len(labels))
-    ]
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=.4,
-        marker=dict(colors=colors_list),
-        textinfo='label+percent',
-        textposition='outside',
-        sort=False,
-        texttemplate=texttemplate
-    )])
-    
-    fig.update_layout(
-        title_text="Detailed SNP Distribution",
-        title_x=0.5,
-        title_y=0.9,
-        title_font=dict(size=24, color=colors['muted']),
-        annotations=[dict(text='SNPs', x=0.5, y=0.5, font_size=20, showarrow=False, font=dict(color=colors['muted']))],
-        paper_bgcolor=colors['stats_tab_color'],
-        plot_bgcolor=colors['stats_tab_color'],
-        font=dict(color=colors['muted']),
-        margin=dict(t=160, b=20, l=20, r=20),
-        showlegend=False,
-        modebar=dict(
-            add=['downloadSVG'],
-            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-        )
-    )
-        
-    return fig
 
 
 def calculate_mean_cg_content(read_lengths, bins):
@@ -1270,31 +1092,23 @@ def calculate_confidence_intervals(counts, total_bases, confidence_level=0.95):
     Calculate binomial confidence intervals for mismatch frequencies.
     
     Parameters:
-    -----------
-    counts : array-like
-        Number of mismatches at each position
-    total_bases : array-like
-        Total number of bases at each position
-    confidence_level : float
-        Confidence level for interval calculation (default: 0.95)
+      counts (array-like): Number of mismatches at each position.
+      total_bases (array-like): Total number of bases at each position.
+      confidence_level (float): Confidence level for interval calculation (default: 0.95).
     
     Returns:
-    --------
-    tuple : (lower_bounds, upper_bounds)
-        Arrays containing lower and upper confidence bounds
+      tuple: (lower_bounds, upper_bounds) arrays with the calculated confidence intervals.
     """
     from scipy import stats
-    
-    frequencies = np.array(counts) / np.maximum(total_bases, 1)
+    # Ensure we do not divide by zero by replacing zeros with 1.
+    total_bases_arr = np.maximum(np.array(total_bases), 1)
+    frequencies = np.array(counts) / total_bases_arr
     z_score = stats.norm.ppf((1 + confidence_level) / 2)
     
-    # Wilson score interval calculation
-    denominator = 1 + z_score**2/np.array(total_bases)
-    center = (frequencies + z_score**2/(2*np.array(total_bases))) / denominator
-    
-    spread = z_score * np.sqrt(
-        (frequencies * (1 - frequencies) + z_score**2/(4*np.array(total_bases))) / np.array(total_bases)
-    ) / denominator
+    # Wilson score interval calculation using safe denominators
+    denominator = 1 + z_score**2 / total_bases_arr
+    center = (frequencies + z_score**2 / (2 * total_bases_arr)) / denominator
+    spread = z_score * np.sqrt((frequencies * (1 - frequencies) + z_score**2 / (4 * total_bases_arr)) / total_bases_arr) / denominator
     
     lower_bounds = np.maximum(0, center - spread)
     upper_bounds = np.minimum(1, center + spread)
@@ -1514,255 +1328,55 @@ def calculate_mismatch_frequency(read_lengths, file_format, sequencing_type):
     return frequencies
 
 
-def create_mismatch_frequency_plot(frequencies, sequencing_type):
-    if not frequencies:
-        fig = go.Figure()
-        fig.update_layout(
-            title_text="Mismatch Frequency Data Not Available",
-            paper_bgcolor=colors['plot_bg'],
-            font=dict(color=colors['muted'])
-        )
-        return fig
-
-    fig = go.Figure()
-    
-    if sequencing_type == 'single':
-        x_values = list(range(len(frequencies['C>T_CpG'])))
-        
-        for mut_type, color, symbol, name in [
-            ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
-            ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
-            ('other', colors['highlight2'], 'diamond', 'Other')
-        ]:
-            # confidence intervals calc
-            site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
-            
-            lower_bounds, upper_bounds = calculate_confidence_intervals(
-                frequencies[f'{mut_type}_counts'],
-                frequencies[site_key]
-            )
-            
-            # Main line
-            fig.add_trace(go.Scatter(
-                x=x_values,
-                y=frequencies[mut_type],
-                name=name,
-                mode='lines+markers',
-                line=dict(color=color),
-                marker=dict(symbol=symbol)
-            ))
-            
-            # Confidence interval
-            fig.add_trace(go.Scatter(
-                x=x_values + x_values[::-1],
-                y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
-                fill='toself',
-                fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
-                line=dict(width=0),
-                showlegend=False,
-                name=f'{name} 95% CI'
-            ))
-            
-            # Size indicators for sample size
-            sizes = frequencies[site_key]
-            normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
-            
-            fig.add_trace(go.Scatter(
-                x=x_values,
-                y=frequencies[mut_type],
-                mode='markers',
-                marker=dict(
-                    size=normalized_sizes,
-                    color=color,
-                    symbol=symbol,
-                    line=dict(width=1, color='white')
-                ),
-                showlegend=False
-            ))
-            
-            # hover text
-            hover_text = [
-                f'Position: {p}<br>'
-                f'Frequency: {f:.4f}<br>'
-                f'Sample size: {s:,}<br>'
-                f'95% CI: [{l:.4f}, {u:.4f}]'
-                for p, f, s, l, u in zip(
-                    x_values,
-                    frequencies[mut_type],
-                    frequencies[site_key],
-                    lower_bounds,
-                    upper_bounds
-                )
-            ]
-            fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
-            fig.data[-3].text = hover_text
-            
-    else:
-        for end, title in [('5_prime', "5' End"), ('3_prime', "3' End")]:
-            for mut_type, color, symbol, base_name in [
-                ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
-                ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
-                ('other', colors['highlight2'], 'diamond', 'Other')
-            ]:
-                name = f"{base_name} ({title})"
-                x_values = list(range(len(frequencies[end][mut_type])))
-                
-                # correct site keys
-                site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
-                
-                lower_bounds, upper_bounds = calculate_confidence_intervals(
-                    frequencies[end][f'{mut_type}_counts'],
-                    frequencies[end][site_key]
-                )
-                
-                # Main line
-                fig.add_trace(go.Scatter(
-                    x=x_values,
-                    y=frequencies[end][mut_type],
-                    name=name,
-                    mode='lines+markers',
-                    line=dict(color=color),
-                    marker=dict(symbol=symbol)
-                ))
-                
-                # Confidence interval
-                fig.add_trace(go.Scatter(
-                    x=x_values + x_values[::-1],
-                    y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
-                    fill='toself',
-                    fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
-                    line=dict(width=0),
-                    showlegend=False,
-                    name=f'{name} 95% CI'
-                ))
-                
-                # size indicators
-                sizes = frequencies[end][site_key]
-                normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
-                
-                fig.add_trace(go.Scatter(
-                    x=x_values,
-                    y=frequencies[end][mut_type],
-                    mode='markers',
-                    marker=dict(
-                        size=normalized_sizes,
-                        color=color,
-                        symbol=symbol,
-                        line=dict(width=1, color='white')
-                    ),
-                    showlegend=False
-                ))
-                
-                # hover text
-                hover_text = [
-                    f'Position: {p}<br>'
-                    f'Frequency: {f:.4f}<br>'
-                    f'Sample size: {s:,}<br>'
-                    f'95% CI: [{l:.4f}, {u:.4f}]'
-                    for p, f, s, l, u in zip(
-                        x_values,
-                        frequencies[end][mut_type],
-                        frequencies[end][site_key],
-                        lower_bounds,
-                        upper_bounds
-                    )
-                ]
-                fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
-                fig.data[-3].text = hover_text
-
-    fig.update_layout(
-        title='Mismatch Frequency vs Distance from Read End with 95% Confidence Intervals',
-        xaxis_title='Position',
-        yaxis_title='Frequency',
-        template='plotly_dark',
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted']),
-        showlegend=True,
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="right",
-            x=0.99,
-            bgcolor='rgba(0,0,0,0.5)'
-        ),
-        yaxis=dict(
-            range=[0, 0.5],  # Set y-axis range from 0 to 0.5 (50%)
-            tickformat='.1%'  # Format y-axis ticks as percentages
-        ),
-        modebar_add=['downloadSVG'],
-        modebar_remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
-        
-
-    )
-
-    return fig
 
 
 
-
-def display_mapdamage_results(output_dir):
-    try:
-        # Parse misincorporation data
-        misincorporation_df = parse_misincorporation(os.path.join(output_dir, 'misincorporation.txt'))
-        # Create misincorporation plot
-        misincorporation_fig = create_misincorporation_plot(misincorporation_df)
-
-        # Parse DNA composition data
-        dnacomp_df = parse_dnacomp(os.path.join(output_dir, 'dnacomp.txt'))
-        dnacomp_fig = create_dnacomp_plot(dnacomp_df)
-
-        # Display certainty metrics if available
-        metrics_content = []
-        mcmc_path = os.path.join(output_dir, 'Stats_out_MCMC.csv')
-        if os.path.exists(mcmc_path):
-            mcmc_df = pd.read_csv(mcmc_path)
-            metrics_content.append(display_certainty_metrics(mcmc_df))
-
-        return html.Div([
-            html.H4("Misincorporation Plot"),
-            dcc.Graph(figure=misincorporation_fig),
-            html.H4("DNA Composition Plot"),
-            dcc.Graph(figure=dnacomp_fig),
-            *metrics_content
-        ])
-    except Exception as e:
-        return html.Div(f"Error processing mapDamage2 results: {e}", className="text-danger")
-
-
-def get_damage_patterns(file_path, file_format, filter_ct=None):
-    five_prime_end = []
-    three_prime_end = []
+def get_damage_read_end(file_path, file_format, filter_ct=None):
+    """
+    Get damage patterns at read ends, accounting for strand orientation
+    """
+    five_prime_patterns = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+    three_prime_patterns = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+    total_reads = 0
 
     if file_format in ['bam', 'sam']:
-        bamfile = pysam.AlignmentFile(file_path, "rb" if file_format == 'bam' else "r", check_sq=False)
-        for read in bamfile:
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
-
-            seq = read.query_sequence
-            deamination_pattern = get_deamination_pattern(read)
-            has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
-            if filter_ct is not None:
-                if filter_ct and not has_ct:
-                    continue
-                elif not filter_ct and has_ct:
+        with pysam.AlignmentFile(file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as bamfile:
+            for read in bamfile:
+                if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
 
-            if read.is_reverse:
-                five_prime_end.append(seq[-1])
-                three_prime_end.append(seq[0])
-            else:
-                five_prime_end.append(seq[0])
-                three_prime_end.append(seq[-1])
-        bamfile.close()
-    else:
-        for record in SeqIO.parse(file_path, file_format):
-            seq = str(record.seq)
-            five_prime_end.append(seq[0])
-            three_prime_end.append(seq[-1])
+                seq = read.query_sequence
+                if not seq:
+                    continue
 
-    return five_prime_end, three_prime_end
+                # Check C>T filter if specified
+                if filter_ct is not None:
+                    deamination_pattern = get_deamination_pattern(read)
+                    has_ct = 'C>T' in deamination_pattern or 'G>A' in deamination_pattern
+                    if filter_ct and not has_ct:
+                        continue
+                    elif not filter_ct and has_ct:
+                        continue
+
+                total_reads += 1
+                
+                # Handle strand orientation
+                if read.is_reverse:
+                    # For reverse strand, swap 5' and 3' ends and complement bases
+                    three_prime_patterns[complement_base(seq[0])] += 1
+                    five_prime_patterns[complement_base(seq[-1])] += 1
+                else:
+                    # Forward strand
+                    five_prime_patterns[seq[0]] += 1
+                    three_prime_patterns[seq[-1]] += 1
+
+    # Normalize counts to percentages
+    if total_reads > 0:
+        for base in 'ACGT':
+            five_prime_patterns[base] = (five_prime_patterns[base] / total_reads) * 100
+            three_prime_patterns[base] = (three_prime_patterns[base] / total_reads) * 100
+
+    return five_prime_patterns, three_prime_patterns
 
 def get_deamination_pattern(read):
     pattern = []
@@ -1817,7 +1431,6 @@ def adjust_nm_for_ct_changes(read_lengths, subtract_ct, ct_count_value): # for f
     return adjusted_read_lengths
 
 
-
 def get_read_length_data(read_lengths):
     lengths = [length for length, _, _, _, _, _ in read_lengths]
     length_counts = pd.Series(lengths).value_counts().sort_index()
@@ -1843,7 +1456,7 @@ def get_read_length_CG_average(read_lengths):
         text_output += f"Length {length}: Mean CG Content: {mean_cg:.4f}\n"
     return text_output
 
-def get_damage_patterns_data(five_prime_end, three_prime_end):
+def get_damage_read_end_data(five_prime_end, three_prime_end):
     five_prime_counts = pd.Series(five_prime_end).value_counts()
     three_prime_counts = pd.Series(three_prime_end).value_counts()
     text_output = "Damage Patterns at Read Ends:\n"
@@ -1921,6 +1534,540 @@ def get_alignment_stats_text(stats):
             text_output += f"{category}: {count}\n"
     return text_output
 
+def create_mismatch_frequency_plot(frequencies, sequencing_type):
+    if not frequencies:
+        fig = go.Figure()
+        fig.update_layout(
+            title_text="Mismatch Frequency Data Not Available",
+            paper_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+        return fig
+
+    fig = go.Figure()
+    
+    if sequencing_type == 'single':
+        x_values = list(range(len(frequencies['C>T_CpG'])))
+        
+        for mut_type, color, symbol, name in [
+            ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
+            ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
+            ('other', colors['highlight2'], 'diamond', 'Other')
+        ]:
+            # Calculate confidence intervals using correct site keys
+            site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+            
+            lower_bounds, upper_bounds = calculate_confidence_intervals(
+                frequencies[f'{mut_type}_counts'],
+                frequencies[site_key]
+            )
+            
+            # Main line
+            fig.add_trace(go.Scatter(
+                x=x_values,
+                y=frequencies[mut_type],
+                name=name,
+                mode='lines+markers',
+                line=dict(color=color),
+                marker=dict(symbol=symbol)
+            ))
+            
+            # Confidence interval
+            fig.add_trace(go.Scatter(
+                x=x_values + x_values[::-1],
+                y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
+                fill='toself',
+                fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
+                line=dict(width=0),
+                showlegend=False,
+                name=f'{name} 95% CI'
+            ))
+            
+            # Add size indicators for sample size
+            sizes = frequencies[site_key]
+            normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
+            
+            fig.add_trace(go.Scatter(
+                x=x_values,
+                y=frequencies[mut_type],
+                mode='markers',
+                marker=dict(
+                    size=normalized_sizes,
+                    color=color,
+                    symbol=symbol,
+                    line=dict(width=1, color='white')
+                ),
+                showlegend=False
+            ))
+            
+            # Add hover text
+            hover_text = [
+                f'Position: {p}<br>'
+                f'Frequency: {f:.4f}<br>'
+                f'Sample size: {s:,}<br>'
+                f'95% CI: [{l:.4f}, {u:.4f}]'
+                for p, f, s, l, u in zip(
+                    x_values,
+                    frequencies[mut_type],
+                    frequencies[site_key],
+                    lower_bounds,
+                    upper_bounds
+                )
+            ]
+            fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
+            fig.data[-3].text = hover_text
+            
+    else:
+        for end, title in [('5_prime', "5' End"), ('3_prime', "3' End")]:
+            for mut_type, color, symbol, base_name in [
+                ('C>T_CpG', colors['highlight'], 'circle', 'C→T (CpG)'),
+                ('C>T_nonCpG', colors['line'], 'square', 'C→T (non-CpG)'),
+                ('other', colors['highlight2'], 'diamond', 'Other')
+            ]:
+                name = f"{base_name} ({title})"
+                x_values = list(range(len(frequencies[end][mut_type])))
+                
+                # Use correct site keys
+                site_key = 'CpG_sites' if mut_type == 'C>T_CpG' else 'nonCpG_sites' if mut_type == 'C>T_nonCpG' else 'other_sites'
+                
+                lower_bounds, upper_bounds = calculate_confidence_intervals(
+                    frequencies[end][f'{mut_type}_counts'],
+                    frequencies[end][site_key]
+                )
+                
+                # Main line
+                fig.add_trace(go.Scatter(
+                    x=x_values,
+                    y=frequencies[end][mut_type],
+                    name=name,
+                    mode='lines+markers',
+                    line=dict(color=color),
+                    marker=dict(symbol=symbol)
+                ))
+                
+                # Confidence interval
+                fig.add_trace(go.Scatter(
+                    x=x_values + x_values[::-1],
+                    y=np.concatenate([upper_bounds, lower_bounds[::-1]]),
+                    fill='toself',
+                    fillcolor=f'rgba{tuple(list(plotly.colors.hex_to_rgb(color)) + [0.2])}',
+                    line=dict(width=0),
+                    showlegend=False,
+                    name=f'{name} 95% CI'
+                ))
+                
+                # Add size indicators
+                sizes = frequencies[end][site_key]
+                normalized_sizes = np.interp(sizes, (min(sizes), max(sizes)), (2, 10))
+                
+                fig.add_trace(go.Scatter(
+                    x=x_values,
+                    y=frequencies[end][mut_type],
+                    mode='markers',
+                    marker=dict(
+                        size=normalized_sizes,
+                        color=color,
+                        symbol=symbol,
+                        line=dict(width=1, color='white')
+                    ),
+                    showlegend=False
+                ))
+                
+                # Add hover text
+                hover_text = [
+                    f'Position: {p}<br>'
+                    f'Frequency: {f:.4f}<br>'
+                    f'Sample size: {s:,}<br>'
+                    f'95% CI: [{l:.4f}, {u:.4f}]'
+                    for p, f, s, l, u in zip(
+                        x_values,
+                        frequencies[end][mut_type],
+                        frequencies[end][site_key],
+                        lower_bounds,
+                        upper_bounds
+                    )
+                ]
+                fig.data[-3].hovertemplate = '%{text}<extra></extra>'  # Main line trace
+                fig.data[-3].text = hover_text
+
+    fig.update_layout(
+        title='Mismatch Frequency vs Distance from Read End with 95% Confidence Intervals',
+        xaxis_title='Position',
+        yaxis_title='Frequency',
+        template='plotly_dark',
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted']),
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="right",
+            x=0.99,
+            bgcolor='rgba(0,0,0,0.5)'
+        ),
+        yaxis=dict(
+            range=[0, 0.5],  # Set y-axis range from 0 to 0.5 (50%)
+            tickformat='.1%'  # Format y-axis ticks as percentages
+        ),
+        modebar_add=['downloadSVG'],
+        modebar_remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+        
+
+    )
+
+    return fig
+
+def create_read_length_histogram(bin_centers, hist, selected_file, read_lengths, bins):
+    read_length_fig = go.Figure()
+
+    # Histogram bars
+    read_length_fig.add_trace(go.Bar(
+        x=bin_centers - 0.5,
+        y=hist,
+        name=f'{selected_file} Read Count',
+        opacity=1,
+        hovertemplate='%{x}: %{y}<extra></extra>',
+        marker_color=colors['line'],
+    ))
+
+    
+    mean_cg_content = calculate_mean_cg_content(read_lengths, bins)
+
+    # CG content markers (including zeros)
+    read_length_fig.add_trace(go.Scatter(
+        x=[x - 0.5 for x in bin_centers],
+        y=mean_cg_content,
+        name=f'{selected_file} Average CG Content',
+        yaxis='y2',
+        mode='markers',
+        marker=dict(color=colors['highlight'], size=8),
+    ))
+
+    # Lines between neighboring bins
+    for i in range(len(bin_centers) - 1):
+        if mean_cg_content[i] > 0 and mean_cg_content[i + 1] > 0:
+            read_length_fig.add_trace(go.Scatter(
+                x=[bin_centers[i] - 0.5, bin_centers[i + 1] - 0.5],
+                y=[mean_cg_content[i], mean_cg_content[i + 1]],
+                mode='lines',
+                line=dict(color=colors['highlight'], width=2),
+                yaxis='y2',
+                showlegend=False
+            ))
+
+    read_length_fig.update_layout(
+        title=dict(text='Read Length Distribution with Average CG Content', font=dict(color=colors['muted'])),
+        uirevision='read_length',
+        xaxis=dict(title='Read Length', color=colors['muted'], tickfont=dict(color=colors['muted'])),
+        yaxis=dict(
+            title=dict(text='Read Count', font=dict(color='#1CA8FF')),
+            showline=True,
+            linecolor='#1CA8FF',
+            tickfont=dict(color=colors['muted']),
+            gridcolor=colors['grid'],
+            gridwidth=1
+        ),
+        yaxis2=dict(
+            title=dict(text='Average CG Content', font=dict(color='#FF4081')),
+            overlaying='y',
+            side='right',
+            range=[0, 1],
+            fixedrange=True,
+            showline=True,
+            linecolor='#FF4081',
+            tickfont=dict(color=colors['muted']),
+            gridcolor=colors['grid'],
+            gridwidth=1
+        ),
+        legend=dict(x=0.85, y=1.15, font=dict(color=colors['muted'])),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        dragmode='select',
+        selectdirection='h',
+        newselection_line_width=2,
+        newselection_line_color=colors['secondary'],
+        newselection_line_dash='dashdot',
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
+    )
+
+    return read_length_fig
+
+def create_cg_content_histogram(cg_contents_for_length, selected_lengths):
+    cg_content_fig = go.Figure()
+
+    if cg_contents_for_length:
+        cg_content_fig.add_trace(go.Histogram(
+            x=cg_contents_for_length,
+            nbinsx=80,
+            marker_color=colors['marker']
+        ))
+        selected_lengths_str = ', '.join(map(str, selected_lengths)) if selected_lengths else 'All'
+        cg_content_fig.update_layout(
+            title=f'CG Content Distribution for Selected Read Length(s): {selected_lengths_str}',
+            xaxis=dict(title='CG Content', color=colors['muted']),
+            yaxis=dict(title='Frequency', color=colors['muted']),
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted']),
+            dragmode='select',
+            newselection_line_width=2,
+            newselection_line_color=colors['secondary'],
+            newselection_line_dash='dashdot',
+            modebar=dict(
+                add=['downloadSVG'],
+                remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+            )
+        )
+    else:
+        cg_content_fig.update_layout(
+            title='No data available for selected read length(s)',
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+
+    return cg_content_fig
+
+def create_mismatch_type_bar_chart(mismatch_counts):
+    # Sort mismatch types for consistent display
+    sorted_mismatches = sorted(mismatch_counts.items(), key=lambda x: (x[0][0], x[0][2]))
+    mutations = [m[0] for m in sorted_mismatches]
+    counts = [m[1] for m in sorted_mismatches]
+    
+    fig = go.Figure(data=[
+        go.Bar(
+            x=mutations,
+            y=counts,
+            marker_color=colors['highlight'],
+            text=counts,
+            textposition='auto',
+        )
+    ])
+    
+    fig.update_layout(
+        title='Mismatch Types Distribution',
+        xaxis=dict(
+            title='Mismatch Type',
+            tickangle=45,
+            color=colors['muted']
+        ),
+        yaxis=dict(
+            title='Count',
+            color=colors['muted']
+        ),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted']),
+        showlegend=False,
+        bargap=0.2,
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
+    )
+    return fig
+
+def create_damage_pattern_plot(mismatches):
+    """
+    Create a 2D heatmap showing damage patterns along read positions
+    """
+    if not mismatches:
+        return go.Figure().update_layout(
+            title='No mismatches found in data',
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+
+    max_pos = max([m['read_pos'] for m in mismatches]) + 1
+    
+    # Initialize arrays for counts and bases
+    counts = {
+        'C>T': np.zeros(max_pos),
+        'G>A': np.zeros(max_pos),
+        'Other': np.zeros(max_pos)
+    }
+    total_positions = np.zeros(max_pos)
+
+    # Count mismatches at each position
+    for mismatch in mismatches:
+        pos = mismatch['read_pos']
+        if pos >= max_pos:
+            continue
+            
+        ref_base = mismatch['ref_base']
+        read_base = mismatch['read_base']
+        is_reverse = mismatch.get('is_reverse', False)
+        
+        total_positions[pos] += 1
+        
+        if is_reverse:
+            if ref_base == 'G' and read_base == 'A':
+                counts['G>A'][pos] += 1
+            elif ref_base == 'C' and read_base == 'T':
+                counts['C>T'][pos] += 1
+            else:
+                counts['Other'][pos] += 1
+        else:
+            if ref_base == 'C' and read_base == 'T':
+                counts['C>T'][pos] += 1
+            elif ref_base == 'G' and read_base == 'A':
+                counts['G>A'][pos] += 1
+            else:
+                counts['Other'][pos] += 1
+
+    # Calculate frequencies with safe division
+    freqs = {}
+    for damage_type in counts:
+        freqs[damage_type] = np.divide(
+            counts[damage_type],
+            np.maximum(total_positions, 1),
+            out=np.zeros_like(counts[damage_type], dtype=float),
+            where=total_positions > 0
+        )
+
+    # Create z-values for heatmap
+    z_values = [freqs['C>T'], freqs['G>A'], freqs['Other']]
+    
+    # Create hover text
+    text_values = []
+    for damage_type in ['C>T', 'G>A', 'Other']:
+        text_row = []
+        for pos in range(max_pos):
+            text_row.append(
+                f'Position: {pos}<br>'
+                f'Count: {int(counts[damage_type][pos])}<br>'
+                f'Total mismatches: {int(total_positions[pos])}<br>'
+                f'Frequency: {freqs[damage_type][pos]:.4f}'
+            )
+        text_values.append(text_row)
+
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=z_values,
+        y=['C>T', 'G>A', 'Other'],
+        x=list(range(max_pos)),
+        colorscale='Viridis',
+        showscale=True,
+        text=text_values,
+        hovertemplate='%{text}<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        title='Damage Pattern Distribution Along Read Length',
+        xaxis=dict(
+            title='Read Position',
+            color=colors['muted'],
+            dtick=5,
+            showgrid=True,
+            gridcolor=colors['grid']
+        ),
+        yaxis=dict(
+            title='Damage Type',
+            color=colors['muted'],
+            showgrid=True,
+            gridcolor=colors['grid']
+        ),
+        paper_bgcolor=colors['plot_bg'],
+        plot_bgcolor=colors['plot_bg'],
+        font=dict(color=colors['muted']),
+        height=400,
+        margin=dict(l=80, r=20, t=40, b=40),
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
+    )
+    
+    return fig
+
+def create_mismatch_pie_chart(stats):
+    mismatch_counts = stats.get('Mismatch Counts')
+    
+    # for everything that has no mismatches 
+    if mismatch_counts == 'N/A' or not mismatch_counts:
+        return go.Figure().update_layout(
+            title_text="No mismatch data available",
+            paper_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+    sorted_keys = sorted(mismatch_counts.keys(), key=lambda x: (x[0], x[2]))  # Sort by base
+    
+    # The rest of the function (plotting) is way too complex for a pretty visualization
+    # Define color ramps for each base using Plotly colors
+    color_map = {
+        'A': plotly.colors.sequential.Blues,
+        'C': plotly.colors.sequential.Oranges,
+        'G': plotly.colors.sequential.Greens,
+        'T': plotly.colors.sequential.Reds_r,
+        'N': plotly.colors.sequential.solar # otherwise not really visible
+    }
+    
+    # Assign colors to each mismatch type
+    colors_list = []
+    brighter_colors = []
+    for key in sorted_keys:
+        base = key[0]
+        ramp_length = len(color_map[base])
+        color_index = sorted_keys.index(key) % ramp_length
+        color = color_map[base][color_index]
+        colors_list.append(color)
+        
+        # Convert color to RGB tuple
+        if color.startswith('#'):
+            rgb_color = plotly.colors.hex_to_rgb(color)
+        elif color.startswith('rgb'):
+            rgb_color = tuple(map(int, color[4:-1].split(',')))
+        else:
+            raise ValueError(f"Unsupported color format: {color}")
+        
+        # Find intermediate color between white and the original color
+        brightened_color = plotly.colors.find_intermediate_color((255, 255, 255), rgb_color, 0.6)
+        brightened_color_hex = rgb_to_hex(brightened_color)
+        brighter_colors.append(brightened_color_hex)
+    
+    labels = sorted_keys
+    values = [mismatch_counts[key] for key in sorted_keys]
+    
+    # Create custom texttemplate with brighter label colors
+    texttemplate = [
+        f'<span style="color:{brighter_colors[i]}">%{{label}}: %{{percent}}</span>' 
+        for i in range(len(labels))
+    ]
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=.4,
+        marker=dict(colors=colors_list),
+        textinfo='label+percent',
+        textposition='outside',
+        sort=False,
+        texttemplate=texttemplate
+    )])
+    
+    fig.update_layout(
+        title_text="Detailed SNP Distribution",
+        title_x=0.5,
+        title_y=0.9,
+        title_font=dict(size=24, color=colors['muted']),
+        annotations=[dict(text='SNPs', x=0.5, y=0.5, font_size=20, showarrow=False, font=dict(color=colors['muted']))],
+        paper_bgcolor=colors['stats_tab_color'],
+        plot_bgcolor=colors['stats_tab_color'],
+        font=dict(color=colors['muted']),
+        margin=dict(t=160, b=20, l=20, r=20),
+        showlegend=False,
+        modebar=dict(
+            add=['downloadSVG'],
+            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
+        )
+    )
+        
+    return fig
 
 def create_mapq_histogram(mapq_scores):
     fig = go.Figure()
@@ -1956,38 +2103,81 @@ def get_filter_options_text(selected_nm, ct_checklist, ct_count_value, mapq_rang
     text_output += f"MAPQ Range: {mapq_range_tuple[0]} - {mapq_range_tuple[1]}\n"
     return text_output
 
-def create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file):
-    damage_df = pd.DataFrame({
-        'Base': five_prime_end + three_prime_end,
-        'End': ['5_prime'] * len(five_prime_end) + ['3_prime'] * len(three_prime_end)
-    })
+def create_damage_at_ends_figure(five_prime_end, three_prime_end, selected_file):
+    if isinstance(five_prime_end, dict) and isinstance(three_prime_end, dict):
+        # If input is already processed dictionaries
+        five_prime_patterns = five_prime_end
+        three_prime_patterns = three_prime_end
+    else:
+        # Process raw lists into base frequency dictionaries
+        five_prime_patterns = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+        three_prime_patterns = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+        
+        # Count frequencies from raw lists
+        total_5p = len(five_prime_end) if five_prime_end else 0
+        total_3p = len(three_prime_end) if three_prime_end else 0
+        
+        if total_5p > 0:
+            for base in five_prime_end:
+                if base in five_prime_patterns:
+                    five_prime_patterns[base] += 1
+            # Convert to percentages
+            for base in five_prime_patterns:
+                five_prime_patterns[base] = (five_prime_patterns[base] / total_5p) * 100
+                
+        if total_3p > 0:
+            for base in three_prime_end:
+                if base in three_prime_patterns:
+                    three_prime_patterns[base] += 1
+            # Convert to percentages
+            for base in three_prime_patterns:
+                three_prime_patterns[base] = (three_prime_patterns[base] / total_3p) * 100
+
     fig = go.Figure()
-    fig.add_trace(go.Histogram(
-        x=damage_df[damage_df['End'] == '5_prime']['Base'],
-        name=f'{selected_file} 5\' end',
-        opacity=0.7,
-        marker_color='blue'
+    bases = ['C', 'G', 'T', 'A']  # Ordered for better visualization
+    five_prime_freqs = [five_prime_patterns[base] for base in bases]
+    three_prime_freqs = [three_prime_patterns[base] for base in bases]
+
+    # 5' end frequencies
+    fig.add_trace(go.Bar(
+        x=bases,
+        y=five_prime_freqs,
+        name=f"{selected_file} 5' end",
+        marker_color='blue',
+        text=[f'{freq:.1f}%' for freq in five_prime_freqs],
+        textposition='auto',
     ))
-    fig.add_trace(go.Histogram(
-        x=damage_df[damage_df['End'] == '3_prime']['Base'],
-        name=f'{selected_file} 3\' end',
-        opacity=0.7,
-        marker_color='red'
+
+    # 3' end frequencies
+    fig.add_trace(go.Bar(
+        x=bases,
+        y=three_prime_freqs,
+        name=f"{selected_file} 3' end",
+        marker_color='red',
+        text=[f'{freq:.1f}%' for freq in three_prime_freqs],
+        textposition='auto',
     ))
+
     fig.update_layout(
-        barmode='group',
-        title='Damage Patterns at Read Ends',
+        title='Damage Patterns at Read Ends (Normalized)',
         xaxis=dict(title='Base', color=colors['muted']),
-        yaxis=dict(title='Frequency', color=colors['muted']),
+        yaxis=dict(
+            title='Frequency (%)',
+            color=colors['muted'],
+            range=[0, max(max(five_prime_freqs), max(three_prime_freqs)) * 1.1]
+        ),
+        barmode='group',
         paper_bgcolor=colors['plot_bg'],
         plot_bgcolor=colors['plot_bg'],
         font=dict(color=colors['muted']),
-        legend=dict(x=0.85, y=1.15, font=dict(color=colors['muted'])),
+        showlegend=True,
+        legend=dict(x=0.85, y=1.15),
         modebar=dict(
             add=['downloadSVG'],
             remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
         )
     )
+
     return fig
 
 
@@ -2009,39 +2199,56 @@ def create_light_theme_figure(fig, width=1200, height=800):
     light_fig.update_layout(
         paper_bgcolor='white',
         plot_bgcolor='white',
-        font=dict(color='black', size=14),  # Increased font size for better readability
+        font=dict(color='black', size=14),
         width=width,
         height=height,
-        margin=dict(l=80, r=40, t=60, b=60),  # Adjusted margins for better layout
+        margin=dict(l=80, r=40, t=60, b=60),
     )
     
-    # Update grid colors and axis properties
+    # Update axis properties with black text
     light_fig.update_xaxes(
         gridcolor='lightgrey', 
         color='black',
-        tickfont=dict(size=12),
-        titlefont=dict(size=14)
+        tickfont=dict(color='black', size=12),
+        titlefont=dict(color='black', size=14)
     )
     light_fig.update_yaxes(
         gridcolor='lightgrey', 
         color='black',
-        tickfont=dict(size=12),
-        titlefont=dict(size=14)
+        tickfont=dict(color='black', size=12),
+        titlefont=dict(color='black', size=14)
     )
-    
-    # Update trace colors and sizes
+
+    # Update trace colors and text colors
     for trace in light_fig.data:
         if trace.type == 'scatter':
-            if trace.line.color == colors['line']:
+            if trace.line and trace.line.color == colors['line']:
                 trace.line.color = '#1f77b4'
-                trace.line.width = 2  # Increased line width
-            elif trace.line.color == colors['highlight']:
+                trace.line.width = 2
+            elif trace.line and trace.line.color == colors['highlight']:
                 trace.line.color = '#d62728'
                 trace.line.width = 2
+            # Update text color for scatter traces
+            if hasattr(trace, 'textfont'):
+                trace.textfont.color = 'black'
         elif trace.type == 'bar':
-            if trace.marker.color == colors['marker']:
+            if trace.marker and trace.marker.color == colors['marker']:
                 trace.marker.color = '#2ca02c'
+            # Update text color for bar traces
+            if hasattr(trace, 'textfont'):
+                trace.textfont.color = 'black'
     
+    # Update legend text color
+    if light_fig.layout.legend:
+        light_fig.layout.legend.font.color = 'black'
+    
+    # Update title text color
+    if light_fig.layout.title:
+        if isinstance(light_fig.layout.title, dict):
+            light_fig.layout.title.font.color = 'black'
+        else:
+            light_fig.layout.title.font = dict(color='black')
+
     return light_fig
 
 def export_plot_to_file(fig, filename, width=1200, height=800, scale=2, format='png'):
@@ -2123,139 +2330,6 @@ settings_offcanvas = dbc.Offcanvas(
     [
         html.H4("Settings", className="mb-3", style={"color": colors['muted']}),
 
-        # General Settings Section
-        dbc.Card([
-            dbc.CardHeader(
-                dbc.Row([
-                    dbc.Col(DashIconify(icon="lucide:sun", width=20, color=colors['on_surface']), width="auto"),
-                    dbc.Col(html.Span("General Settings", style={"margin-left": "8px"})),
-                ], align="center"),
-                style={"background-color": colors['surface'], "color": colors['muted']}
-            ),
-            dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Theme", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Dropdown(
-                            id="theme-dropdown",
-                            options=[
-                                {"label": "Dark Mode", "value": "dark"},
-                                {"label": "Light Mode", "value": "light"}
-                            ],
-                            value="dark",
-                            clearable=False,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
-                    ], width=12),
-                ], className="g-2"),
-            ]),
-        ], className="mb-3", style={"background-color": colors['surface']}),
-
-        # Data Processing Section
-        dbc.Card([
-            dbc.CardHeader(
-                dbc.Row([
-                    dbc.Col(DashIconify(icon="lucide:database", width=20, color=colors['on_surface']), width="auto"),
-                    dbc.Col(html.Span("Data Processing", style={"margin-left": "8px"})),
-                ], align="center"),
-                style={"background-color": colors['surface'], "color": colors['muted']}
-            ),
-            dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Maximum Read Length", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Input(
-                            id="max-read-length",
-                            type="number",
-                            value=1000,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
-                    ], width=6),
-                    dbc.Col([
-                        dbc.Label("Minimum Quality Score", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Input(
-                            id="min-quality-score",
-                            type="number",
-                            value=20,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                                }
-                        ),
-                    ], width=6),
-                ], className="g-2"),
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Centrifuge DB Path", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dbc.InputGroup([
-                            dbc.Input(
-                                id="centrifuge-db-path",
-                                type="text",
-                                value=default_centrifuge_db_path,
-                                placeholder="/path/to/centrifuge/db",
-                                style={
-                                    "background-color": colors['surface'],
-                                    "color": colors['on_surface'],
-                                    "border": f"1px solid {colors['muted']}",
-                                    "width": "100%",
-                                }
-                            ),
-                        ], className="mb-3"),
-                    ], width=12),
-                ], className="g-2"),
-            ]),
-        ], className="mb-3", style={"background-color": colors['surface']}),
-
-        # Visualization Preferences Section
-        dbc.Card([
-            dbc.CardHeader(
-                dbc.Row([
-                    dbc.Col(DashIconify(icon="lucide:pie-chart", width=20, color=colors['on_surface']), width="auto"),
-                    dbc.Col(html.Span("Visualization Preferences", style={"margin-left": "8px"})),
-                ], align="center"),
-                style={"background-color": colors['surface'], "color": colors['muted']}
-            ),
-            dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Color Themes", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Dropdown(
-                            id="color-theme-dropdown",
-                            options=[
-                                {"label": "Default", "value": "default"},
-                                {"label": "Cool Blues", "value": "cool"},
-                                {"label": "Warm Reds", "value": "warm"}
-                            ],
-                            value="default",
-                            clearable=False,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
-                    ], width=12),
-                ], className="g-2"),
-            ]),
-        ], className="mb-3", style={"background-color": colors['surface']}),
-
         # Performance Settings Section
         dbc.Card([
             dbc.CardHeader(
@@ -2268,40 +2342,18 @@ settings_offcanvas = dbc.Offcanvas(
             dbc.CardBody([
                 dbc.Row([
                     dbc.Col([
-                        dbc.Label("Max Threads", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Input(
-                            id="max-threads",
-                            type="number",
-                            value=4,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
-                    ], width=6),
-                    dbc.Col([
-                        dbc.Label("Cache Size (MB)", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Input(
-                            id="cache-size",
-                            type="number",
-                            value=100,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
+                        dbc.Switch(
+                            id="show-performance-stats",
+                            label="Show Performance Statistics",
+                            value=False,
+                            className="mb-3"
+                        )
                     ], width=6),
                 ], className="g-2"),
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # Plot Export Settings Section
+        # Add Plot Export Settings Section
         dbc.Card([
             dbc.CardHeader(
                 dbc.Row([
@@ -2420,44 +2472,8 @@ settings_offcanvas = dbc.Offcanvas(
             ]),
         ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # Export Settings Section
-        dbc.Card([
-            dbc.CardHeader(
-                dbc.Row([
-                    dbc.Col(DashIconify(icon="lucide:file-text", width=20, color=colors['on_surface']), width="auto"),
-                    dbc.Col(html.Span("Export Settings", style={"margin-left": "8px"})),
-                ], align="center"),
-                style={"background-color": colors['surface'], "color": colors['muted']}
-            ),
-            dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Default Export Format", style={"color": colors['muted'], "margin-bottom": "4px"}),
-                        dcc.Dropdown(
-                            id="export-format-dropdown",
-                            options=[
-                                {"label": "CSV", "value": "csv"},
-                                {"label": "TSV", "value": "tsv"},
-                                {"label": "BAM", "value": "bam"},
-                                {"label": "SAM", "value": "sam"}
-                                
-                            ],
-                            value="csv",
-                            clearable=False,
-                            style={
-                                "background-color": colors['surface'],
-                                "color": colors['on_surface'],
-                                "border": f"1px solid {colors['muted']}",
-                                "width": "100%",
-                                "margin-bottom": "10px"
-                            }
-                        ),
-                    ], width=12),
-                ], className="g-2"),
-            ]),
-        ], className="mb-3", style={"background-color": colors['surface']}),
 
-        # apply and Reset Buttons
+        # set and Reset Buttons
         html.Div(
             [
                 dbc.Button("Apply Settings", id="apply-settings-button", color="success", className="me-2"),
@@ -2471,28 +2487,6 @@ settings_offcanvas = dbc.Offcanvas(
     placement="end",
     is_open=False,
     style={"width": "450px", "background-color": colors['surface'], "color": colors['muted']}
-)
-
-# Console Offcanvas
-console_offcanvas = dbc.Offcanvas(
-    [
-        html.H5("Console Log", className="mb-3", style={"color": colors['muted']}),
-        html.Div(id='console-log', className='console-log', style={
-            'whiteSpace': 'pre-wrap',
-            'height': '100%',
-            'overflowY': 'scroll',
-            'backgroundColor': colors['background'],
-            'padding': '10px',
-            'border': f'1px solid {colors["muted"]}',
-            'borderRadius': '4px',
-            'fontFamily': 'monospace'
-        })
-    ],
-    id="console-offcanvas",
-    title="Console Log",
-    placement="end",
-    is_open=False,
-    style={"width": "900px", "backgroundColor": colors['surface']}
 )
 
 
@@ -2543,7 +2537,7 @@ layout_file_viewer = dbc.Container([
                                     value=[0, 255],
                                     marks={i: {'label': str(i), 'style': {'color': colors['muted']}} for i in range(0, 256, 25)},
                                     tooltip={"placement": "bottom", "always_visible": True},
-                                    updatemode='drag',
+                                    updatemode='mouseup',
                                     className="mb-3",
                                 ),
                                 dbc.Label("Minimum Base Quality: ", className="mt-3"),
@@ -2706,7 +2700,11 @@ layout_file_viewer = dbc.Container([
         ], width=11),
     ], justify='center'),
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
- 
+
+
+
+
+# Define the Navbar separately for reuse 
 navbar = dbc.Navbar(
     dbc.Container([
         dcc.Link(
@@ -2724,46 +2722,42 @@ navbar = dbc.Navbar(
         dbc.Collapse(
             dbc.Nav([
                 dbc.NavItem(dcc.Link("Home", href="/", className="nav-link")),
-                dbc.NavItem(dcc.Link("Simulation", href="/simulation", className="nav-link")),
                 dbc.NavItem(dcc.Link("Convert", href="/convert", className="nav-link")),
                 dbc.NavItem(dcc.Link("File Viewer", href="/file-viewer", className="nav-link")),
-                dbc.NavItem(dbc.Button("Console", id="console-button", color="light", outline=True, className="me-2")),
                 dbc.NavItem(dbc.Button("Settings", id="settings-button", color="light", outline=True)),
             ], className="ms-auto", navbar=True),
             id="navbar-collapse",
             navbar=True,
         ),
-        console_offcanvas,
     ]),
     color=colors['surface'],
     dark=True,
     className="mb-4",
 )
 
+
+
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     navbar,
     create_merge_modal(),
     html.Div(id='page-content'),
-    # Stores and Downloads
+    # Stores and Download components
     dcc.Store(id='file-store', data={'files': []}),
     dcc.Store(id='viewer-page-index', data=0),
     dcc.Store(id='selected-lengths', data=[]),
     dcc.Store(id='read-length-selection-store'),
     dcc.Store(id='selected-cg-contents', data=[]),
-    dcc.Interval(id='centrifuge-interval', interval=5000, n_intervals=0, disabled=True),
-    dcc.Interval(id='console-interval', interval=2000, n_intervals=0),
-    dcc.Store(id='centrifuge-task-id'),
-    dcc.Store(id='centrifuge-output-path'),
     dcc.Download(id="download-file"),
     dcc.Download(id="download-plots"),
     dcc.Download(id='download-merged-file'),
     dcc.Store(id='merged-file-store', data=None),
-    dcc.Store(id='mapdamage-task-id'),
-    dcc.Store(id='mapdamage-output-dir'),
-    dcc.Location(id='url', refresh=False),
+
 ])
 
+
+
+# Converter Page Layout
 layout_convert = dbc.Container([
     dbc.Row([
         dbc.Col([
@@ -2798,6 +2792,8 @@ layout_convert = dbc.Container([
         ], width=8),
     ], justify='center'),
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
+
+
 
 layout_main = dbc.Container([
     dbc.Row([
@@ -2866,7 +2862,7 @@ layout_main = dbc.Container([
                         value='show',  # Default value
                         labelStyle={'display': 'block'},
                         className="mb-4",
-                    ),                    
+                    ),                     
                     html.Label("Mismatch Filter (BAM/SAM only):", className="mb-2"),
                     dcc.Dropdown(
                         id='nm-dropdown',
@@ -2910,12 +2906,6 @@ layout_main = dbc.Container([
                         clearable=False,
                         className="mb-4",
                     ),
-                    dbc.Button("Run Centrifuge Analysis", id="centrifuge-button", color="primary", className="w-100 mb-3"),
-                    dcc.Loading(
-                        id="loading-centrifuge",
-                        type="circle",
-                        children=html.Div(id="centrifuge-output"),
-                    ),
                     dbc.Button("Export Selected Reads", id="export-button", color="secondary", className="w-100 mb-3"),
                     dbc.Button("Show Alignment Statistics", id="stats-button", color="info", className="w-100 mb-3"),
                     dbc.Button("Clear Selection", id="clear-selection-button", outline=True, color="danger", className="w-100"),
@@ -2942,6 +2932,7 @@ layout_main = dbc.Container([
                 ])
             ], className="mb-4"),
 
+
             # Analysis Results Section
             dbc.Card([
                 dbc.CardBody([
@@ -2961,54 +2952,6 @@ layout_main = dbc.Container([
                             dbc.Tab(html.Pre(id='data-summary', style={'whiteSpace': 'pre-wrap'}), label="Data Summary"),
                         ])
                     ),
-                    html.Div([
-                        dbc.Button(
-                            [
-                                DashIconify(icon="mdi:download", className="me-2"),
-                                "Export Plots"
-                            ],
-                            id="export-plots-button",
-                            color="secondary",
-                            className="mb-3 mt-3"
-                        ),
-                        dcc.Download(id="download-plots")
-                    ], className="d-flex justify-content-end"),    
-                ])
-            ], className="mb-4"),
-
-            # MapDamage2 Analysis Section
-            dbc.Card([
-                dbc.CardBody([
-                    html.H2("mapDamage2 Analysis", className="card-title mb-4"),
-                    html.Label("Select BAM File:", className="mb-2"),
-                    dcc.Dropdown(
-                        id='mapdamage-bam-selector',
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        placeholder="Select a BAM file",
-                        className="mb-4",
-                    ),
-                    html.Label("Select Reference Genome (FASTA):", className="mb-2"),
-                    dcc.Dropdown(
-                        id='mapdamage-ref-selector',
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        placeholder="Select a reference genome",
-                        className="mb-4",
-                    ),
-                    dbc.Button("Run mapDamage2 Analysis", id="run-mapdamage-button", color="primary"),
-                    html.Div(id="mapdamage-status", className="mt-3"),
-                    dcc.Loading(
-                        id="loading-mapdamage",
-                        type="circle",
-                        children=[
-                            html.Div(id='mapdamage-output')
-                        ]
-                    ),
-                    dcc.Interval(id='mapdamage-interval', interval=5000, n_intervals=0, disabled=True),
-                    
                 ])
             ], className="mb-4"),
         ], width=9),
@@ -3025,6 +2968,10 @@ layout_main = dbc.Container([
 
     # Settings offcanvas
     settings_offcanvas,
+
+    # Stores and Download component
+
+
 ], fluid=True, className="px-4 py-3", style={"backgroundColor": colors['background']})
 
 
@@ -3036,7 +2983,7 @@ app.validation_layout = html.Div([
 ])
 
 
-# custom CSS, have to merge with external assets css
+# Add custom CSS, have to merge with external assets css
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -3061,12 +3008,6 @@ app.index_string = '''
             }
             .nav-link:hover {
                 color: ''' + colors['on_surface'] + ''' !important;
-            }
-            .console-log pre {
-                background-color: transparent;
-                color: inherit;
-                font-family: monospace;
-                white-space: pre-wrap;
             }
             .upload-box {
                 border: 2px dashed ''' + colors['secondary'] + ''';
@@ -3122,13 +3063,23 @@ app.index_string = '''
 ##################################################################################
 
 
+
+
+
+
+
+
+
+
+
+
 ################### FILE VIEWER ##################
 
 @app.callback(
     Output('viewer-ct-checklist', 'value'),
     [Input('viewer-ct-checklist', 'value')]
 )
-def enforce_mutual_exclusivity(selected_values): # only one C>T checkbox can be selected at a time
+def enforce_mutual_exclusivity(selected_values):
     if len(selected_values) > 1:
         # Keep only the last selected option
         return [selected_values[-1]]
@@ -3142,10 +3093,8 @@ def enforce_mutual_exclusivity(selected_values): # only one C>T checkbox can be 
 def display_page(pathname):
     if pathname == '/convert':
         return layout_convert
-    elif pathname == '/simulation':
-        return simulation.layout
     elif pathname == '/file-viewer':
-        return layout_file_viewer  
+        return layout_file_viewer  # New File Viewer layout
     else:
         return layout_main
 
@@ -3219,7 +3168,7 @@ def display_file_content(
     if file_data is None:
         return html.Div("File not found.", className="text-muted"), True, True, "", page_index
 
-    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
+    temp_file_path, file_format = parse_uploaded_file(file_data['content'], file_data['filename'])
 
     ct_checklist_tuple = tuple(ct_checklist)
 
@@ -3238,7 +3187,7 @@ def display_file_content(
     
     mapq_range_tuple = tuple(mapq_range)
 
-    read_lengths, file_format, deduped_file_path = load_and_process_file(
+    read_lengths, file_format, deduped_file_path = read_quality_control(
         file_data['content'], file_data['filename'], selected_nm, filter_ct, exclusively_ct, ct_count_value,
         ct_checklist_tuple, mapq_range_tuple, min_base_quality
     )
@@ -3381,6 +3330,8 @@ def get_reference_sequence(read): # quite unneccessary, was initially implemente
     if read.is_unmapped or read.reference_id < 0:
         return None
     # need access to the reference genome sequence
+    # Assuming you have a dictionary or function that maps reference names to sequences
+    # For example, reference_sequences = {'chr1': 'ATGCT...'}
     ref_name = read.reference_name
     ref_start = read.reference_start
     ref_end = read.reference_end
@@ -3432,34 +3383,6 @@ def highlight_mismatches(read, softclip_display='show_all'):
         f'<pre style="margin: 0; font-size: 14px; line-height: 1.5;">{highlighted_seq}</pre>'
     )
 
-def get_base_style(read_base, ref_base, is_softclipped, is_reverse, softclip_display):
-    """Helper function to determine base styling"""
-    base_color = "lightblue"  # default color for matched bases
-    
-    if is_softclipped:
-        if softclip_display == 'highlight':
-            return f'<span style="color: gray; background-color: #444444; padding: 0 2px;">{read_base}</span>'
-        else:
-            return f'<span style="color: gray;">{read_base}</span>'
-            
-    if ref_base is not None:
-        read_base_upper = read_base.upper()
-        ref_base_upper = ref_base.upper()
-        
-        if read_base_upper != ref_base_upper:
-            if is_reverse:
-                if ref_base_upper == 'G' and read_base_upper == 'A':
-                    base_color = "orange"
-                else:
-                    base_color = "red"
-            else:
-                if ref_base_upper == 'C' and read_base_upper == 'T':
-                    base_color = "orange"
-                else:
-                    base_color = "red"
-    
-    return f'<span style="color: {base_color};">{read_base}</span>'
-
 reference_sequences = {}
 
 @app.callback(
@@ -3470,7 +3393,8 @@ def load_reference_sequences(file_store_data): # unused for now, not necessary
     global reference_sequences
     for f in file_store_data.get('files', []):
         if f['format'] in ['fasta', 'fa', 'fna']:
-            temp_file_path, _ = process_uploaded_file(f['content'], f['filename'])
+            temp_file_path, _ = parse_uploaded_file(f['content'], f['filename'])
+            # Parse the reference genome and store sequences
             for record in SeqIO.parse(temp_file_path, 'fasta'):
                 reference_sequences[record.id] = str(record.seq)
     return {'status': 'Reference genome loaded'}
@@ -3495,7 +3419,7 @@ file_merger = FileMerger()
         Output('merged-file-store', 'data')
     ],
     [
-        Input({"type": "merge-files-button", "index": ALL}, 'n_clicks'), 
+        Input({"type": "merge-files-button", "index": ALL}, 'n_clicks'),  # Pattern matching
         Input('close-merge-modal', 'n_clicks'),
         Input('execute-merge-button', 'n_clicks')
     ],
@@ -3514,7 +3438,7 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
         
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-#checklist options from stored files
+    # Generate checklist options from stored files
     checklist_options = []
     if store_data and 'files' in store_data:
         first_file_format = None
@@ -3569,11 +3493,11 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
             def progress_callback(value, message):
                 current_progress["value"] = value
 
-            # Merge files
+            # Merge the files based on their format
             if files_to_merge[0]['format'] in ['bam', 'sam']:
                 merged_content = merge_bam_files(files_to_merge, progress_callback)
             else:
-                merged_content = merge_sequence_files(files_to_merge, files_to_merge[0]['format'])
+                merged_content = merge_fastq_files(files_to_merge, files_to_merge[0]['format'])
 
             # Create merged file data
             merged_file_data = {
@@ -3598,7 +3522,7 @@ def handle_merge_operations(merge_clicks, close_clicks, execute_clicks,
 
     return is_open, "", checklist_options, 0, None
 
-
+# New callback to handle the download of merged files
 @app.callback(
     Output('download-merged-file', 'data'),
     Input('merged-file-store', 'data'),
@@ -3608,17 +3532,21 @@ def download_merged_file(merged_file_data):
     if not merged_file_data:
         raise PreventUpdate
     
+    # Create a temporary file for the merged content
     temp_dir = os.path.join(CUSTOM_TEMP_DIR, f"merge_{uuid.uuid4()}")
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, merged_file_data['filename'])
     
     try:
+        # Decode and write the merged content
         content = base64.b64decode(merged_file_data['content'])
         with open(temp_path, 'wb') as f:
             f.write(content)
         
+        # Trigger the download
         return dcc.send_file(temp_path)
     finally:
+        # Cleanup
         if os.path.exists(temp_path):
             os.remove(temp_path)
         if os.path.exists(temp_dir):
@@ -3639,13 +3567,16 @@ def merge_bam_files(files, progress_callback=None):
     temp_files = []
     
     try:
+        # Calculate total reads for progress tracking
         total_reads = 0
         processed_reads = 0
         
+        # First, convert any SAM files to BAM and index all files
         for file_data in files:
-            temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+            temp_file_path, _ = parse_uploaded_file(file_data['content'], file_data['filename'])
             temp_files.append(temp_file_path)
             
+            # Convert SAM to BAM if necessary
             if file_data['format'] == 'sam':
                 bam_path = os.path.join(CUSTOM_TEMP_DIR, f"temp_{uuid.uuid4()}.bam")
                 with pysam.AlignmentFile(temp_file_path, "r") as samfile:
@@ -3655,13 +3586,17 @@ def merge_bam_files(files, progress_callback=None):
                 temp_file_path = bam_path
                 temp_files.append(bam_path)
             
+            # Count reads using pysam.view
             total_reads += sum(1 for _ in pysam.view("-c", temp_file_path, catch_stdout=True))
+            
+            # Open the BAM file
             bamfile = pysam.AlignmentFile(temp_file_path, "rb")
             file_handles.append(bamfile)
         
         if progress_callback:
             progress_callback(5, "Counted total reads")
             
+        # Collect reference sequences from all files
         all_references = set()
         reference_lengths = {}
         header_dict = None
@@ -3681,23 +3616,31 @@ def merge_bam_files(files, progress_callback=None):
         if progress_callback:
             progress_callback(10, "Collected reference sequences")
 
+        # Create new unified header
         new_header = {
             'HD': header_dict.get('HD', {'VN': '1.6', 'SO': 'coordinate'}),
             'SQ': [{'SN': ref, 'LN': reference_lengths[ref]} for ref in sorted(all_references)],
             'PG': header_dict.get('PG', [])
         }
         
+        # Create reference name mapping
         ref_to_id = {ref: idx for idx, ref in enumerate(sorted(all_references))}
+        
+        # Create temporary merged BAM file
         temp_merged = os.path.join(CUSTOM_TEMP_DIR, f"temp_merged_{uuid.uuid4()}.bam")
         temp_files.append(temp_merged)
         
         with pysam.AlignmentFile(temp_merged, "wb", header=new_header) as outfile:
             for i, bamfile in enumerate(file_handles):
+                
                 for read in bamfile:
+                    # Handle reference IDs correctly
                     if not read.is_unmapped:
                         try:
                             old_ref_name = bamfile.get_reference_name(read.reference_id)
                             read.reference_id = ref_to_id[old_ref_name]
+                            
+                            # Update mate reference if paired
                             if read.is_paired and not read.mate_is_unmapped:
                                 old_mate_ref_name = bamfile.get_reference_name(read.next_reference_id)
                                 read.next_reference_id = ref_to_id[old_mate_ref_name]
@@ -3723,7 +3666,7 @@ def merge_bam_files(files, progress_callback=None):
         sorted_output = os.path.join(CUSTOM_TEMP_DIR, f"sorted_merged_{uuid.uuid4()}.bam")
         temp_files.append(sorted_output)
         
-        # Sort bam file
+        # Sort using pysam.sort
         pysam.sort("-o", sorted_output, temp_merged)
         
         # Index the sorted file
@@ -3755,7 +3698,7 @@ def merge_bam_files(files, progress_callback=None):
             except Exception as e:
                 print(f"Error removing temporary file {temp_file}: {e}")
 
-def merge_sequence_files(files, format_type):
+def merge_fastq_files(files, format_type):
     """
     Merge FASTA/FASTQ files with validation and error handling
     
@@ -3770,7 +3713,7 @@ def merge_sequence_files(files, format_type):
     used_ids = set()
     
     for file_data in files:
-        temp_file_path, _ = process_uploaded_file(file_data['content'], file_data['filename'])
+        temp_file_path, _ = parse_uploaded_file(file_data['content'], file_data['filename'])
         for record in SeqIO.parse(temp_file_path, format_type):
             # Handle potential duplicate IDs
             original_id = record.id
@@ -3804,49 +3747,7 @@ def update_merge_progress(progress_value, status_message):
     ]
 
 
-##### Console #####################
-    
-@app.callback(
-    Output("console-offcanvas", "is_open"),
-    [Input("console-button", "n_clicks")],
-    [State("console-offcanvas", "is_open")],
-)
-def toggle_console(n_clicks, is_open):
-    if n_clicks:
-        return not is_open
-    return is_open
 
-@app.callback(
-    Output('console-log', 'children'),
-    [Input('console-interval', 'n_intervals')]
-)
-def update_console_log(n):
-    log_file_path = os.path.join(os.path.dirname(__file__), 'celery.log')
-    try:
-        with open(log_file_path, 'r') as f:
-            lines = f.readlines()
-            last_lines = lines[-200:]  # Adjust if needed
-            log_text = ''.join(last_lines)
-            
-            # classes for different log levels
-            log_text = log_text.replace('[ERROR]', '<span class="log-error">[ERROR]</span>')
-            log_text = log_text.replace('[WARNING]', '<span class="log-warning">[WARNING]</span>')
-            log_text = log_text.replace('[INFO]', '<span class="log-info">[INFO]</span>')
-            log_text = log_text.replace('[DEBUG]', '<span class="log-debug">[DEBUG]</span>')
-            
-            # Convert ANSI to HTML
-            conv = Ansi2HTMLConverter(inline=True)
-            html_content = conv.convert(log_text, full=False)
-            
-            # Wrap the HTML content in a div with appropriate styling
-            styled_html = f'''
-            <div style="color: #f8f9fa; background-color: {colors['background']};">
-                {html_content}
-            </div>
-            '''
-            return dash_dangerously_set_inner_html.DangerouslySetInnerHTML(styled_html)
-    except Exception as e:
-        return f'Error reading log file: {e}'
 
 #######################################################
 
@@ -3883,7 +3784,7 @@ def convert_files(n_clicks, contents_list, filenames, output_format):
     for content, filename in zip(contents_list, filenames):
         try:
             
-            temp_input_path, input_format = process_uploaded_file(content, filename)
+            temp_input_path, input_format = parse_uploaded_file(content, filename)
 
             
             supported_conversions = {
@@ -4038,257 +3939,7 @@ def update_filenames(filenames):
 #######################################################
 
 
-######### Mapdamage Section ###########################
 
-
-@app.callback(
-    [Output('mapdamage-output', 'children'),
-     Output('mapdamage-interval', 'disabled')],
-    [Input('mapdamage-interval', 'n_intervals')],
-    [State('mapdamage-task-id', 'data'),
-     State('mapdamage-output-dir', 'data')]
-)
-def update_mapdamage_output(n_intervals, task_id, output_dir):
-    if not task_id:
-        raise dash.exceptions.PreventUpdate
-
-    task_result = run_mapdamage_task.AsyncResult(task_id)
-    state = task_result.state
-
-    if state == 'PENDING':
-        return html.Div("mapDamage2 analysis is pending...", className="text-info"), False
-    elif state == 'STARTED':
-        return html.Div("mapDamage2 analysis is running...", className="text-info"), False
-    elif state == 'SUCCESS':
-        # Disable the interval
-        # Process and display the results
-        return display_mapdamage_results(output_dir), True
-    elif state == 'FAILURE':
-        error = str(task_result.info)
-        return html.Div(f"Error running mapDamage2: {error}", className="text-danger"), True
-    else:
-        return html.Div(f"mapDamage2 analysis state: {state}", className="text-info"), False
-
-
-
-@app.callback(
-    [Output('mapdamage-status', 'children'),
-     Output('mapdamage-task-id', 'data')],
-    [Input('run-mapdamage-button', 'n_clicks')],
-    [State('mapdamage-bam-selector', 'value'),
-     State('mapdamage-ref-selector', 'value'),
-     State('file-store', 'data')]
-)
-def run_mapdamage(n_clicks, selected_bam, selected_ref, store_data):
-    if not n_clicks:
-        return dash.no_update, None
-
-    if selected_bam is None:
-        return html.Div("Please select a BAM file.", className="text-danger"), None
-
-    if selected_ref is None:
-        return html.Div("Please select a reference genome.", className="text-danger"), None
-
-    bam_file_data = next((f for f in store_data['files'] if f['filename'] == selected_bam), None)
-    if bam_file_data is None:
-        return html.Div("Selected BAM file not found.", className="text-danger"), None
-    bam_path = process_uploaded_file(bam_file_data['content'], bam_file_data['filename'])[0]
-
-    ref_file_data = next((f for f in store_data['files'] if f['filename'] == selected_ref), None)
-    if ref_file_data is None:
-        return html.Div("Selected reference genome not found.", className="text-danger"), None
-    ref_path = process_uploaded_file(ref_file_data['content'], ref_file_data['filename'])[0]
-
-    output_dir = os.path.join(CUSTOM_TEMP_DIR, f"mapdamage_results_{uuid.uuid4()}")
-    os.makedirs(output_dir, exist_ok=True)
-
-
-    task = run_mapdamage_task.delay(bam_path, ref_path, output_dir)
-
-    return html.Div(f"mapDamage2 analysis started. Task ID: {task.id}", className="text-info"), task.id
-
-
-#######################################################
-
-
-
-######## Settings and stats menu ###############################
-
-
-# Callback to toggle settings offcanvas
-@app.callback(
-    Output("settings-offcanvas", "is_open"),
-    [Input("settings-button", "n_clicks"),
-     Input('apply-settings-button', 'n_clicks')],
-    [State("settings-offcanvas", "is_open"),
-     State('centrifuge-db-path', 'value')],
-    prevent_initial_call=True
-)
-def toggle_settings(settings_click, apply_click, is_open, centrifuge_db_path):
-    ctx = dash.callback_context
-
-    if not ctx.triggered:
-        return is_open
-    else:
-        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        if button_id == 'settings-button':
-            return not is_open # open settings
-        elif button_id == 'apply-settings-button':
-            # Save settings
-            config['centrifuge_db_path'] = centrifuge_db_path
-            with open('config.yaml', 'w') as f:
-                yaml.dump(config, f)
-            return False  # Close settings offcanvas
-    return is_open
-
-
-@app.callback(
-    Output('alignment-stats', 'children'),
-    [Input('file-selector', 'value'),
-     Input('file-store', 'data')]
-)
-def update_alignment_stats(selected_file, store_data):
-    if selected_file is None:
-        return html.Div("No file selected.", className="text-muted")
-
-    file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
-    if file_data is None:
-        return html.Div("No data available.", className="text-muted")
-
-    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
-
-    stats = calculate_alignment_stats(temp_file_path, file_format)
-
-    stats_text = get_alignment_stats_text(stats)
-
-    # mismatch info only if it's available
-    mismatch_info = []
-    if isinstance(stats.get('Mismatch Counts'), dict):  # This ensures it's only for SAM/BAM files
-        mismatch_info = [
-            html.Li(f"C>T Changes: {stats['Mismatch Counts'].get('C>T', 0)}"),
-            html.Li(f"G>A Changes: {stats['Mismatch Counts'].get('G>A', 0)}"),
-            html.Li(f"Other Mismatches: {sum(stats['Mismatch Counts'].values()) - stats['Mismatch Counts'].get('C>T', 0) - stats['Mismatch Counts'].get('G>A', 0)}")
-        ]
-
-    mismatch_pie_chart = create_detailed_mismatch_pie_chart(stats)
-
-    return html.Div([
-        html.Ul([
-            html.Li(f"Total Reads: {stats['Total Reads']}"),
-            html.Li(f"Mapped Reads: {stats['Mapped Reads']} ({stats['Mapped Percentage']:.2f}%)" if stats['Mapped Reads'] != 'N/A' else "Mapped Reads: N/A"),
-            html.Li(f"Duplicate Reads: {stats['Duplicate Reads']} ({stats['Duplicate Percentage']:.2f}%)" if stats['Duplicate Reads'] != 'N/A' else "Duplicate Reads: N/A"),
-            html.Li(f"Total Mismatches: {stats['Total Mismatches']}")
-        ] + mismatch_info),
-        dcc.Graph(figure=mismatch_pie_chart)
-    ])
-
-@app.callback(
-    Output('stats-offcanvas', 'is_open'),
-    [Input('stats-button', 'n_clicks')],
-    [State('stats-offcanvas', 'is_open')]
-)
-def toggle_offcanvas(n_clicks, is_open):
-    if n_clicks:
-        return not is_open
-    return is_open
-
-#############################################################
-
-
-
-####### CENTRIFUGE IMPLEMENTATION ###########################
-
-def parse_and_display_centrifuge_results(report_path):
-    try:
-        df = pd.read_csv(report_path, sep='\t')
-    except Exception as e:
-        return html.Div(f"Error reading Centrifuge report: {e}", className="text-danger")
-    
-    top_n = 10
-    df_top = df.head(top_n)
-
-    fig = go.Figure(data=[go.Bar(
-        x=df_top['name'],
-        y=df_top['numUniqueReads'],
-        text=df_top['taxID'],
-        hoverinfo='text',
-    )])
-
-    fig.update_layout(
-        title='Top Taxonomic Classifications',
-        xaxis_title='Taxon',
-        yaxis_title='Number of Unique Reads',
-        paper_bgcolor=colors['plot_bg'],
-        plot_bgcolor=colors['plot_bg'],
-        font=dict(color=colors['muted']),
-        modebar=dict(
-            add=['downloadSVG'],
-            remove=['zoom', 'pan', 'select', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d']
-        )
-    )
-
-    return dcc.Graph(figure=fig)
-
-
-
-@app.callback(
-    [Output('centrifuge-output', 'children'),
-     Output('centrifuge-interval', 'disabled'),
-     Output('centrifuge-task-id', 'data'),
-     Output('centrifuge-output-path', 'data')],
-    [Input('centrifuge-button', 'n_clicks')],
-    [State('file-selector', 'value'),
-     State('file-store', 'data'),
-     State('centrifuge-db-path', 'value')],
-    prevent_initial_call=True
-)
-def run_centrifuge(n_clicks, selected_file, store_data, db_path):
-    if selected_file is None:
-        return html.Div("No file selected for analysis.", className="text-danger"), True, None, None
-
-    if not db_path:
-        return html.Div("Centrifuge database path not specified. Please set it in the settings.", className="text-danger"), True, None, None
-
-    
-    file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
-    if file_data is None:
-        return html.Div("File data not found.", className="text-danger"), True, None, None
-
-    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
-
-    # file must be in fastq (centrifuge only supports fastq; might add automatic conversion)
-    if file_format not in ['fastq', 'fq']:
-        return html.Div("Centrifuge requires FASTQ files. Please upload a FASTQ file.", className="text-danger"), True, None, None
-
-    
-    centrifuge_output_path = os.path.join(CUSTOM_TEMP_DIR, f"centrifuge_output_{uuid.uuid4()}.txt")
-    centrifuge_report_path = os.path.join(CUSTOM_TEMP_DIR, f"centrifuge_report_{uuid.uuid4()}.txt")
-
-    
-    task = run_centrifuge_task.delay(temp_file_path, centrifuge_output_path, centrifuge_report_path, db_path)
-
-    # return message
-    return html.Div(f"Centrifuge analysis started. Task ID: {task.id}", className="text-success"), False, task.id, centrifuge_report_path
-
-
-
-def update_centrifuge_output(n_intervals, task_id, centrifuge_report_path):
-    if not task_id:
-        raise dash.exceptions.PreventUpdate
-
-    task_result = run_centrifuge_task.AsyncResult(task_id)
-    if task_result.state == 'PENDING':
-        return html.Div("Centrifuge analysis is pending...", className="text-info"), False
-    elif task_result.state == 'STARTED':
-        return html.Div("Centrifuge analysis is running...", className="text-info"), False
-    elif task_result.state == 'SUCCESS':
-        # Disable the interval
-        return parse_and_display_centrifuge_results(centrifuge_report_path), True
-    elif task_result.state == 'FAILURE':
-        return html.Div(f"Error running Centrifuge: {task_result.info}", className="text-danger"), True
-    else:
-        return html.Div(f"Centrifuge analysis state: {task_result.state}", className="text-info"), False
-    
 
 
 #####################################################################
@@ -4362,7 +4013,7 @@ def export_plots(n_clicks, *args):
 )
 def update_ct_checklist(ct_value):
     if len(ct_value) > 1:
-        # Keep only last selected option
+        # Keep only the last selected option
         return [ct_value[-1]]
     return ct_value
 
@@ -4372,8 +4023,6 @@ def update_ct_checklist(ct_value):
         Output('file-store', 'data'),
         Output('file-selector', 'options'),
         Output('file-selector', 'value'),
-        Output('mapdamage-bam-selector', 'options'),
-        Output('mapdamage-ref-selector', 'options')
     ],
     [
         Input('upload-data', 'contents'),
@@ -4389,11 +4038,9 @@ def update_file_store(contents, filenames, store_data, current_selection):
         store_data = {'files': []}
 
     if contents is None:
-        # existing options from store_data
+        # Use existing options from store_data
         options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files']]
-        bam_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] == 'bam']
-        ref_options = [{'label': f['filename'], 'value': f['filename']} for f in store_data['files'] if f['format'] in ['fasta', 'fa', 'fna']]
-        return store_data, options, current_selection, bam_options, ref_options
+        return store_data, options, current_selection
 
     files = store_data.get('files', [])
     new_file_added = False
@@ -4408,17 +4055,13 @@ def update_file_store(contents, filenames, store_data, current_selection):
     store_data['files'] = files
     options = [{'label': f['filename'], 'value': f['filename']} for f in files]
 
-    # Populate BAM file options for mapDamage2
-    bam_options = [{'label': f['filename'], 'value': f['filename']} for f in files if f['format'] == 'bam']
 
-    # Populate FASTA file options for reference genome selector
-    ref_options = [{'label': f['filename'], 'value': f['filename']} for f in files if f['format'] in ['fasta', 'fa', 'fna']]
 
-    # auto select first file
+    # Automatically select the first file if no file is currently selected
     if current_selection is None and new_file_added:
         current_selection = files[0]['filename']
 
-    return store_data, options, current_selection, bam_options, ref_options
+    return store_data, options, current_selection
 
 
 
@@ -4426,6 +4069,31 @@ def update_file_store(contents, filenames, store_data, current_selection):
 ###########################################################################################################
 
 ###########################################################################################################
+
+@app.callback(
+    Output("settings-offcanvas", "is_open"),
+    [Input("settings-button", "n_clicks"),
+     Input('apply-settings-button', 'n_clicks')],
+    [State("settings-offcanvas", "is_open")],
+    prevent_initial_call=True
+)
+def toggle_settings(settings_click, apply_click, is_open):
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        return is_open
+    else:
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if button_id == 'settings-button':
+            return not is_open
+        elif button_id == 'apply-settings-button':
+            # Save settings
+            # old centrifuge implementation
+            with open('config.yaml', 'w') as f:
+                yaml.dump(config, f)
+            return False  # Close settings offcanvas
+    return is_open
+
 
 @app.callback(
     [
@@ -4461,7 +4129,7 @@ def update_file_store(contents, filenames, store_data, current_selection):
 )
 
 
-def update_histograms(
+def update_plots(
     selected_file, 
     store_data, 
     mapq_range, 
@@ -4538,7 +4206,7 @@ def update_histograms(
     mismatch_freq_fig = empty_mismatch_fig
     old_mismatch_freq_fig = empty_mismatch_fig
 
-    read_lengths, file_format, deduped_file_path = load_and_process_file(
+    read_lengths, file_format, deduped_file_path = load_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct,
         exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple, min_base_quality,
         soft_clip_option=soft_clip_handling
@@ -4582,38 +4250,58 @@ def update_histograms(
     cg_content_fig = create_cg_content_histogram(cg_contents_for_length, selected_lengths)
 
     # Damage Patterns Figure
-    five_prime_end, three_prime_end = get_damage_patterns(deduped_file_path, file_format, filter_ct=filter_ct)
-    damage_fig = create_damage_pattern_figure(five_prime_end, three_prime_end, selected_file)
+    five_prime_end, three_prime_end = get_damage_read_end(deduped_file_path, file_format, filter_ct=filter_ct)
+    damage_fig = create_damage_at_ends_figure(five_prime_end, three_prime_end, selected_file)
 
     mapq_scores = [mapq for _, _, _, _, _, mapq in read_lengths if mapq is not None]
     # MAPQ histogram
     mapq_fig = create_mapq_histogram(mapq_scores)
 
     # alignment stats
-    temp_file_path, file_format = process_uploaded_file(file_data['content'], file_data['filename'])
+    temp_file_path, file_format = parse_uploaded_file(file_data['content'], file_data['filename'])
     stats = calculate_alignment_stats(temp_file_path, file_format)
 
+    # Mismatch type and damage pattern plots
     mismatch_type_fig = go.Figure()
     damage_pattern_fig = go.Figure()
-    if stats.get('Mismatch Details') != 'N/A':
-        filtered_mismatches = filter_mismatches(
-            stats['Mismatch Details'],
-            min_base_quality=min_base_quality,
-            min_mapping_quality=mapq_range[0]
-        )
+    
+    if file_format in ['bam', 'sam']:
+        filtered_mismatches = []
+        for _, _, _, _, read, _ in read_lengths:
+            if not read.is_unmapped:
+                mismatches = get_mismatches(read)
+                if min_base_quality != 'all':
+                    mismatches = [m for m in mismatches if m['base_quality'] >= int(min_base_quality)]
+                for mismatch in mismatches:
+                    mismatch['is_reverse'] = read.is_reverse
+                filtered_mismatches.extend(mismatches)
+
         filtered_mismatch_counts = {}
         for mismatch in filtered_mismatches:
             key = f"{mismatch['ref_base']}>{mismatch['read_base']}"
             filtered_mismatch_counts[key] = filtered_mismatch_counts.get(key, 0) + 1
 
-        # Plotting
         mismatch_type_fig = create_mismatch_type_bar_chart(filtered_mismatch_counts)
         damage_pattern_fig = create_damage_pattern_plot(filtered_mismatches)
+    else:
+        # Default empty plots for non-BAM/SAM files
+        mismatch_type_fig.update_layout(
+            title='Mismatch Types Not Available for This File Format',
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
+        damage_pattern_fig.update_layout(
+            title='Damage Patterns Not Available for This File Format',
+            paper_bgcolor=colors['plot_bg'],
+            plot_bgcolor=colors['plot_bg'],
+            font=dict(color=colors['muted'])
+        )
 
     # Data summary 
     read_length_text = get_read_length_data(read_lengths)
     cg_content_text = get_overall_cg_content_data(read_lengths)
-    damage_patterns_text = get_damage_patterns_data(five_prime_end, three_prime_end)
+    damage_patterns_text = get_damage_read_end_data(five_prime_end, three_prime_end)
     mismatch_frequency_text = get_mismatch_frequency_data(frequencies, sequencing_type)
     stats_text = get_alignment_stats_text(stats)
     read_length_cg_average_text = get_read_length_CG_average(read_lengths)
@@ -4654,7 +4342,55 @@ def update_histograms(
 
 
 
+@app.callback(
+    Output('alignment-stats', 'children'),
+    [Input('file-selector', 'value'),
+     Input('file-store', 'data')]
+)
+def update_alignment_stats(selected_file, store_data):
+    if selected_file is None:
+        return html.Div("No file selected.", className="text-muted")
 
+    file_data = next((f for f in store_data['files'] if f['filename'] == selected_file), None)
+    if file_data is None:
+        return html.Div("No data available.", className="text-muted")
+
+    temp_file_path, file_format = parse_uploaded_file(file_data['content'], file_data['filename'])
+
+    stats = calculate_alignment_stats(temp_file_path, file_format)
+
+    stats_text = get_alignment_stats_text(stats)
+
+    # mismatch info only if it's available
+    mismatch_info = []
+    if isinstance(stats.get('Mismatch Counts'), dict):  # This ensures it's only for SAM/BAM files
+        mismatch_info = [
+            html.Li(f"C>T Changes: {stats['Mismatch Counts'].get('C>T', 0)}"),
+            html.Li(f"G>A Changes: {stats['Mismatch Counts'].get('G>A', 0)}"),
+            html.Li(f"Other Mismatches: {sum(stats['Mismatch Counts'].values()) - stats['Mismatch Counts'].get('C>T', 0) - stats['Mismatch Counts'].get('G>A', 0)}")
+        ]
+
+    mismatch_pie_chart = create_mismatch_pie_chart(stats)
+
+    return html.Div([
+        html.Ul([
+            html.Li(f"Total Reads: {stats['Total Reads']}"),
+            html.Li(f"Mapped Reads: {stats['Mapped Reads']} ({stats['Mapped Percentage']:.2f}%)" if stats['Mapped Reads'] != 'N/A' else "Mapped Reads: N/A"),
+            html.Li(f"Duplicate Reads: {stats['Duplicate Reads']} ({stats['Duplicate Percentage']:.2f}%)" if stats['Duplicate Reads'] != 'N/A' else "Duplicate Reads: N/A"),
+            html.Li(f"Total Mismatches: {stats['Total Mismatches']}")
+        ] + mismatch_info),
+        dcc.Graph(figure=mismatch_pie_chart)
+    ])
+
+@app.callback(
+    Output('stats-offcanvas', 'is_open'),
+    [Input('stats-button', 'n_clicks')],
+    [State('stats-offcanvas', 'is_open')]
+)
+def toggle_offcanvas(n_clicks, is_open):
+    if n_clicks:
+        return not is_open
+    return is_open
     
 
 
@@ -4669,12 +4405,11 @@ def update_histograms(
         State('ct-count-dropdown', 'value'),
         State('mapq-range', 'value'),
         State('selected-lengths', 'data'),
-        State('soft-clip-handling', 'value')
     ],
     prevent_initial_call=True
 )
-def export_reads(
-    n_clicks, selected_file, store_data, selected_nm, ct_checklist, ct_count_value, mapq_range, selected_lengths, soft_clip_option
+def callback_export_reads(
+    n_clicks, selected_file, store_data, selected_nm, ct_checklist, ct_count_value, mapq_range, selected_lengths
 ):
     if n_clicks is None or n_clicks == 0:
         raise dash.exceptions.PreventUpdate
@@ -4710,7 +4445,7 @@ def export_reads(
         return None
 
     # Re-process the file with all filters applied
-    read_lengths, file_format, deduped_file_path = load_and_process_file(
+    read_lengths, file_format, deduped_file_path = load_file(
         file_data['content'], file_data['filename'], selected_nm, filter_ct,
         exclusively_ct, ct_count_value, ct_checklist_tuple, mapq_range_tuple
     )
@@ -4726,12 +4461,10 @@ def export_reads(
     # Export the selected reads with filters applied
     export_selected_reads(
         read_lengths, selected_lengths, selected_cg_content, output_file_path,
-        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes, soft_clip_option=soft_clip_option
+        deduped_file_path, file_format, selected_nm, filter_ct, exact_ct_changes,
     )
 
     return dcc.send_file(output_file_path)
-
-
 
 
 
@@ -4757,50 +4490,5 @@ def export_reads(
 ##########################################################################################################
 
 if __name__ == '__main__':
-    log_file_path = os.path.join(os.path.dirname(__file__), 'celery.log')
 
-    def log_to_file(process, log_file_path):
-        with open(log_file_path, 'w') as log_file:
-            while True:
-                output = process.stdout.readline()
-                if process.poll() is not None and output == b'':
-                    break
-                if output:
-                    log_file.write(output)
-                    log_file.flush()
-
-    # start Celery worker
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        # Set up the environment to include the project root in PYTHONPATH, otherwise might lead to some issues with celery
-        env = os.environ.copy()
-        project_root = os.path.abspath(os.path.dirname(__file__))
-        env['PYTHONPATH'] = os.pathsep.join([env.get('PYTHONPATH', ''), project_root])
-
-        worker_process = subprocess.Popen(
-            [
-                sys.executable, '-m', 'celery', '-A', 'utils.tasks.celery_app', 'worker',
-                '--loglevel=info'
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            universal_newlines=True,
-            env=env  
-        )
-        # new thread for log output
-        log_thread = threading.Thread(target=log_to_file, args=(worker_process, log_file_path))
-        log_thread.daemon = True
-        log_thread.start()
-
-        print(f"Started Celery worker with PID: {worker_process.pid}")
-
-    else:
-        worker_process = None
-
-    try:
-        app.run_server(debug=True)
-    finally:
-        if worker_process:
-            print("Terminating Celery worker...")
-            worker_process.terminate()
-            worker_process.wait()
+    app.run_server(debug=True)
