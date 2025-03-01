@@ -2,8 +2,7 @@
 
 ## Overview
 
-GRAFT is a Python-based toolkit for analyzing ancient DNA data through an interactive web interface. The application integrates sequence data visualization, quality assessment, and filtering capabilities specific to degraded DNA analysis. Built on Dash and Plotly, GRAFT processes BAM, SAM, FASTA, and FASTQ files with support for taxonomic classification through Centrifuge and post-mortem damage assessment via mapDamage2.
-
+GRAFT is a Python-based toolkit for analyzing ancient DNA data through an interactive web interface. The application integrates sequence data visualization, quality assessment, and filtering capabilities specific to degraded DNA analysis. Built on Dash and Plotly, GRAFT processes BAM, SAM, FASTA, and FASTQ files.
 ## Core Functions
 
 * Interactive sequence data visualization
