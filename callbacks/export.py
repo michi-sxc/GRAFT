@@ -5,6 +5,10 @@ import uuid
 import zipfile
 import shutil
 import logging
+import pysam
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
 from app import app 
 from config import CUSTOM_TEMP_DIR
@@ -12,6 +16,104 @@ from processing.read_operations import export_selected_reads
 from plotting.utils import export_plot_to_file 
 
 logger = logging.getLogger(__name__)
+
+def export_reads_from_dicts(read_dicts_list, selected_lengths, output_file_path, output_format):
+    """
+    Export reads from serialized dictionaries instead of original tuples.
+    This is a modified version that works with the processed-data-store format.
+    """
+    logger.info(f"Exporting {len(read_dicts_list)} read dictionaries with lengths in {selected_lengths} to {output_file_path} (format: {output_format})")
+    count = 0
+    selected_lengths_set = set(selected_lengths)
+
+    # Filter reads by selected lengths
+    filtered_reads = [r for r in read_dicts_list if r.get('length') in selected_lengths_set]
+    
+    if not filtered_reads:
+        logger.warning("No reads match the selected lengths for export.")
+        return
+
+    try:
+        if output_format in ['bam', 'sam']:
+            # Create a minimal header for BAM/SAM export
+            header_dict = {
+                'HD': {'VN': '1.6', 'SO': 'unsorted'},
+                'SQ': []  # No reference sequences for filtered reads
+            }
+            
+            with pysam.AlignmentFile(output_file_path, "wb" if output_format == 'bam' else "w", header=header_dict) as outfile:
+                for read_dict in filtered_reads:
+                    # Reconstruct AlignedSegment from dictionary
+                    read = pysam.AlignedSegment()
+                    read.query_name = read_dict.get('name', f'read_{count}')
+                    read.query_sequence = read_dict.get('seq', '')
+                    
+                    # Handle mapping information
+                    if read_dict.get('is_mapped', False):
+                        read.flag = read_dict.get('flag', 0)
+                        read.mapping_quality = read_dict.get('mapq', 0)
+                        read.cigarstring = read_dict.get('cigarstring', '*')
+                        # Set reference info (would need reference name/ID for proper reconstruction)
+                        read.reference_id = -1  # Unmapped reference
+                        read.reference_start = -1
+                    else:
+                        read.flag = 4  # Unmapped
+                        read.reference_id = -1
+                        read.reference_start = -1
+                        read.mapping_quality = 0
+                        read.cigarstring = '*'
+                    
+                    # Add qualities if available
+                    qualities = read_dict.get('query_qualities')
+                    if qualities:
+                        read.query_qualities = qualities
+                    
+                    # Add NM tag if available
+                    nm_value = read_dict.get('original_nm_tag') or read_dict.get('nm')
+                    if nm_value is not None:
+                        read.set_tag('NM', nm_value)
+                    
+                    outfile.write(read)
+                    count += 1
+
+        elif output_format in ['fasta', 'fastq']:
+            with open(output_file_path, "w") as outfile:
+                for read_dict in filtered_reads:
+                    # Create SeqRecord from dictionary
+                    seq_str = read_dict.get('seq', '')
+                    read_id = read_dict.get('name', f'read_{count}')
+                    
+                    record = SeqRecord(
+                        Seq(seq_str),
+                        id=read_id,
+                        description=read_dict.get('description', '')
+                    )
+                    
+                    # Add qualities for FASTQ
+                    if output_format == 'fastq':
+                        qualities = read_dict.get('query_qualities')
+                        if qualities:
+                            record.letter_annotations["phred_quality"] = qualities
+                        else:
+                            # Assign default quality scores if missing
+                            record.letter_annotations["phred_quality"] = [30] * len(seq_str)
+                    
+                    SeqIO.write(record, outfile, output_format)
+                    count += 1
+        else:
+            raise ValueError(f"Unsupported output format for export: {output_format}")
+
+        logger.info(f"Successfully exported {count} selected reads.")
+
+    except Exception as e:
+        logger.error(f"Error during read export to {output_file_path}: {e}", exc_info=True)
+        # Clean up partially written file
+        if os.path.exists(output_file_path):
+            try: 
+                os.remove(output_file_path)
+            except OSError: 
+                pass
+        raise
 
 # --- Export Selected Reads ---
 @app.callback(
@@ -52,9 +154,9 @@ def trigger_export_selected_reads(n_clicks, processed_data, selected_lengths):
     output_path = os.path.join(CUSTOM_TEMP_DIR, output_filename)
 
     try:
-        # Call the export function with the list of read tuples and selected lengths
-        export_selected_reads(
-            read_tuple_list=reads_to_export, # Pass the already filtered list
+        # Use the new function that works with dictionaries
+        export_reads_from_dicts(
+            read_dicts_list=reads_to_export,
             selected_lengths=selected_lengths,
             output_file_path=output_path,
             output_format=output_format
