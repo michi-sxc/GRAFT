@@ -17,10 +17,10 @@ from plotting.utils import export_plot_to_file
 
 logger = logging.getLogger(__name__)
 
-def export_reads_from_dicts(read_dicts_list, selected_lengths, output_file_path, output_format):
+def export_reads_from_dicts(read_dicts_list, selected_lengths, output_file_path, output_format, file_header=None):
     """
-    Export reads from serialized dictionaries instead of original tuples.
-    This is a modified version that works with the processed-data-store format.
+    Export reads from serialized dictionaries while preserving original mapping information.
+    This reconstructs the complete SAM/BAM format with proper reference context.
     """
     logger.info(f"Exporting {len(read_dicts_list)} read dictionaries with lengths in {selected_lengths} to {output_file_path} (format: {output_format})")
     count = 0
@@ -35,43 +35,53 @@ def export_reads_from_dicts(read_dicts_list, selected_lengths, output_file_path,
 
     try:
         if output_format in ['bam', 'sam']:
-            # Create a minimal header for BAM/SAM export
-            header_dict = {
-                'HD': {'VN': '1.6', 'SO': 'unsorted'},
-                'SQ': []  # No reference sequences for filtered reads
-            }
+            # Use provided header or create a minimal one
+            if file_header:
+                header_dict = file_header
+            else:
+                # Fallback to minimal header
+                header_dict = {
+                    'HD': {'VN': '1.6', 'SO': 'unsorted'},
+                    'SQ': []
+                }
+                logger.warning("No header provided for BAM/SAM export, using minimal header")
             
             with pysam.AlignmentFile(output_file_path, "wb" if output_format == 'bam' else "w", header=header_dict) as outfile:
                 for read_dict in filtered_reads:
-                    # Reconstruct AlignedSegment from dictionary
+                    # Fully reconstruct AlignedSegment from stored information
                     read = pysam.AlignedSegment()
+                    
+                    # Basic read information
                     read.query_name = read_dict.get('name', f'read_{count}')
                     read.query_sequence = read_dict.get('seq', '')
                     
-                    # Handle mapping information
-                    if read_dict.get('is_mapped', False):
-                        read.flag = read_dict.get('flag', 0)
-                        read.mapping_quality = read_dict.get('mapq', 0)
-                        read.cigarstring = read_dict.get('cigarstring', '*')
-                        # Set reference info (would need reference name/ID for proper reconstruction)
-                        read.reference_id = -1  # Unmapped reference
-                        read.reference_start = -1
-                    else:
-                        read.flag = 4  # Unmapped
-                        read.reference_id = -1
-                        read.reference_start = -1
-                        read.mapping_quality = 0
-                        read.cigarstring = '*'
+                    # Reconstruct all mapping information exactly as it was
+                    read.flag = read_dict.get('flag', 4)  # Default to unmapped if missing
+                    read.reference_id = read_dict.get('reference_id', -1)
+                    read.reference_start = read_dict.get('reference_start', -1)
+                    read.mapping_quality = read_dict.get('mapping_quality', 0)
+                    read.cigarstring = read_dict.get('cigarstring', '*')
+                    read.next_reference_id = read_dict.get('next_reference_id', -1)
+                    read.next_reference_start = read_dict.get('next_reference_start', -1)
+                    read.template_length = read_dict.get('template_length', 0)
                     
-                    # Add qualities if available
+                    # Add quality scores
                     qualities = read_dict.get('query_qualities')
                     if qualities:
                         read.query_qualities = qualities
+                    else:
+                        # Only add dummy qualities if the read has sequence
+                        seq_len = len(read_dict.get('seq', ''))
+                        if seq_len > 0:
+                            read.query_qualities = [30] * seq_len
                     
-                    # Add NM tag if available
-                    nm_value = read_dict.get('original_nm_tag') or read_dict.get('nm')
-                    if nm_value is not None:
-                        read.set_tag('NM', nm_value)
+                    # Restore all original tags
+                    tags = read_dict.get('tags', {})
+                    for tag_name, tag_value in tags.items():
+                        try:
+                            read.set_tag(tag_name, tag_value)
+                        except Exception as e:
+                            logger.warning(f"Could not set tag {tag_name}={tag_value}: {e}")
                     
                     outfile.write(read)
                     count += 1
@@ -154,12 +164,14 @@ def trigger_export_selected_reads(n_clicks, processed_data, selected_lengths):
     output_path = os.path.join(CUSTOM_TEMP_DIR, output_filename)
 
     try:
-        # Use the new function that works with dictionaries
+        # Use the new function that works with dictionaries and preserves mapping info
+        file_header = processed_data.get('file_header')
         export_reads_from_dicts(
             read_dicts_list=reads_to_export,
             selected_lengths=selected_lengths,
             output_file_path=output_path,
-            output_format=output_format
+            output_format=output_format,
+            file_header=file_header
         )
 
         if os.path.exists(output_path):
@@ -186,7 +198,7 @@ def trigger_export_selected_reads(n_clicks, processed_data, selected_lengths):
      State('mismatch-frequency-plot', 'figure'),
      State('mismatch-type-bar-chart', 'figure'),
      State('damage-pattern-plot', 'figure'),
-     State('mapq-histogram', 'figure'), # Added MAPQ plot
+     State('mapq-histogram', 'figure'),
      # Settings from settings offcanvas
      State('plot-width-input', 'value'),
      State('plot-height-input', 'value'),
@@ -217,7 +229,7 @@ def trigger_export_all_plots(n_clicks, fig_len, fig_cg_overall, fig_cg_sel, fig_
         f'{base_filename}_mapq': fig_mapq,
     }
 
-    # Create a temporary directory for the individual plot files
+    # Temporary directory for the individual plot files
     temp_plot_dir = os.path.join(CUSTOM_TEMP_DIR, f"plots_export_{uuid.uuid4().hex[:8]}")
     os.makedirs(temp_plot_dir, exist_ok=True)
     logger.info(f"Created temporary plot export directory: {temp_plot_dir}")
@@ -266,7 +278,7 @@ def trigger_export_all_plots(n_clicks, fig_len, fig_cg_overall, fig_cg_sel, fig_
         logger.error(f"Error during plot ZIP creation: {e}", exc_info=True)
         return None
     finally:
-        # Clean up the temporary directory with individual plots
+    
         if os.path.exists(temp_plot_dir):
             try:
                 shutil.rmtree(temp_plot_dir)
