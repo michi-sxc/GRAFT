@@ -1,7 +1,7 @@
 # GRAFT - Genomic Read Analysis and Filtering Tool
 
 [![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
-[![GitHub last commit](https://img.shields.io/github/last-commit/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/commits/main)
+[![GitHub last commit](https://img.shields.io/github/last-commit/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/graft2/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/issues)
 [![License](https://img.shields.io/github/license/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/blob/main/LICENSE)
 [![Maintenance](https://img.shields.io/badge/maintenance-inactive-red.svg)](https://github.com/michi-sxc/GRAFT)
@@ -55,9 +55,14 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
    chmod -R u+w .
    ```
 
-3. Execute setup:
+3. Install requirements:
    ```bash
-   python setup.py
+   pip install -r requirements.txt
+   ```
+
+4. Run index.py:
+   ```bash
+   python index.py
    ```
 
 ### Windows (WSL)
@@ -112,15 +117,6 @@ The setup creates the following permission structure:
 * Format conversion between BAM/SAM/FASTA/FASTQ
 * Batch processing capabilities
 * Automatic quality control
-
-## Configuration
-
-Edit `config.yaml` to set:
-```yaml
-centrifuge_db_path: /path/to/centrifuge/db
-max_threads: 4
-cache_size: 100
-```
 
 ## Temporary Files
 
