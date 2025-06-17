@@ -4,7 +4,7 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/graft2/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/issues)
 [![License](https://img.shields.io/github/license/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/blob/main/LICENSE)
-[![Maintenance](https://img.shields.io/badge/maintenance-inactive-red.svg)](https://github.com/michi-sxc/GRAFT)
+[![Maintenance](https://img.shields.io/badge/maintenance-active-green.svg)](https://github.com/michi-sxc/GRAFT)
 
 
 ## Overview
