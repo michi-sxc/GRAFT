@@ -21,8 +21,7 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
 
 ## Technical Requirements
 
-* Python 3.9+
-* Redis server
+* Python 3.12+
 * Core dependencies:
   ```
   dash==2.17.1
@@ -81,7 +80,7 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
    python setup.py
    ```
 
-Note: If running under WSL on a Windows filesystem (NTFS), the setup script will automatically relocate the project to the WSL filesystem to ensure proper permissions handling.
+Note: If you want to use the deprecated DUST masking module, execute setup.py in the DUST folder.
 
 ### File Permissions Structure
 
