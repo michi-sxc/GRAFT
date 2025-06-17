@@ -1,6 +1,6 @@
 # GRAFT - Genomic Read Analysis and Filtering Tool
 
-[![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![GitHub last commit](https://img.shields.io/github/last-commit/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/graft2/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/issues)
 [![License](https://img.shields.io/github/license/michi-sxc/GRAFT.svg)](https://github.com/michi-sxc/GRAFT/blob/main/LICENSE)
