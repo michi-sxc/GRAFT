@@ -17,16 +17,20 @@ def load_reads_from_file(file_content, filename, soft_clip_option='show'):
     Loads all reads from a file into a list of tuples.
     Handles different file formats and soft-clipping interpretation for length.
     Input: Base64 content, filename, soft_clip_option ('show', 'exclude_regions', 'exclude_all').
-    Returns: List of tuples [(length, cg, nm, seq, read_obj, mapq)], file_format, temp_file_path
+    Returns: List of tuples [(length, cg, nm, seq, read_obj, mapq)], file_format, temp_file_path, header_dict
     """
     logger.info(f"Loading reads from {filename} with soft_clip_option='{soft_clip_option}'")
     temp_file_path, file_format = parse_uploaded_file(file_content, filename)
     reads_data = []
+    header_dict = None  # Store the file header
 
     try:
         if file_format in ['bam', 'sam']:
             # check_sq=False could be used
             with pysam.AlignmentFile(temp_file_path, "rb" if file_format == 'bam' else "r", check_sq=False) as infile:
+                # Store the header for later use in exports
+                header_dict = infile.header.to_dict() if infile.header else None
+                
                 for read in infile:
                     # --- Determine Sequence and Length based on Soft Clipping Option ---
                     sequence = read.query_sequence if read.query_sequence is not None else ""
@@ -42,7 +46,7 @@ def load_reads_from_file(file_content, filename, soft_clip_option='show'):
                              # Length of the aligned portion (excluding soft clips)
                              read_length = read.query_alignment_length
                         elif soft_clip_option == 'exclude_all':
-                             read_length = read.query_length # wiht soft clips
+                             read_length = read.query_length # with soft clips
                         else: # 'show' or default
                              read_length = read.query_length 
 
@@ -72,7 +76,7 @@ def load_reads_from_file(file_content, filename, soft_clip_option='show'):
              # Should not happen if parse_uploaded_file is correct
 
         logger.info(f"Successfully loaded {len(reads_data)} reads from {filename}.")
-        return reads_data, file_format, temp_file_path
+        return reads_data, file_format, temp_file_path, header_dict
 
     except Exception as e:
         logger.error(f"Error loading reads from {temp_file_path} ({filename}): {e}", exc_info=True)
