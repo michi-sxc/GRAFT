@@ -13,7 +13,7 @@ from processing.read_operations import load_reads_from_file
 from processing.filters import filter_read_tuples, adjust_nm_for_ct, deduplicate_reads
 from processing.stats import (
     calculate_alignment_stats, get_damage_read_end, calculate_mismatch_frequency_vs_end,
-    get_mismatch_counts_by_type, categorize_mismatches
+    get_mismatch_counts_by_type, categorize_mismatches, get_mismatches_from_read
 )
 from plotting.histograms import (
     create_read_length_histogram, create_overall_cg_histogram,
@@ -352,7 +352,7 @@ def load_and_process_data(
     try:
         # --- 1. Load Raw Reads ---
         _update_progress_ui(1, f"Loading raw reads from {selected_file}...")
-        raw_reads_data_tuples, file_format_inferred, _ = load_reads_from_file(
+        raw_reads_data_tuples, file_format_inferred, _, file_header = load_reads_from_file(
             file_data['content'],
             file_data['filename'],
             soft_clip_option=soft_clip_option
@@ -442,25 +442,70 @@ def load_and_process_data(
         # --- 7. Serialize Reads for processed-data-store ---
         _update_progress_ui(7, "Serializing reads for display...")
         serializable_reads = []
+        
+        # Store the header for potential export use
+        file_header = None
+        if file_format_inferred in ['bam', 'sam'] and final_reads_tuples:
+            # Get header from the first read's original file context if possible
+            first_read_obj = final_reads_tuples[0][4]
+            if isinstance(first_read_obj, pysam.AlignedSegment):
+                try:
+                    # Try to get header - this might not always work depending on how pysam handles it
+                    file_header = first_read_obj.header.to_dict() if hasattr(first_read_obj, 'header') else None
+                except:
+                    logger.warning("Could not extract header from read object")
+        
         for length, cg, nm_val, seq_str, read_obj, mapq_val in final_reads_tuples:
             record_info = {
                 'length': length, 'cg': cg, 'nm': nm_val, 'seq': seq_str, 'mapq': mapq_val,
                 'original_nm': read_obj.get_tag('NM') if isinstance(read_obj, pysam.AlignedSegment) and read_obj.has_tag('NM') else nm_val,
             }
             if isinstance(read_obj, pysam.AlignedSegment):
+                # Store comprehensive mapping information
                 record_info.update({
-                    'name': read_obj.query_name, 'flag': read_obj.flag,
-                    'is_mapped': not read_obj.is_unmapped, 'is_reverse': read_obj.is_reverse,
+                    'name': read_obj.query_name,
+                    'flag': read_obj.flag,
+                    'is_mapped': not read_obj.is_unmapped,
+                    'is_reverse': read_obj.is_reverse,
                     'cigarstring': read_obj.cigarstring,
+                    # Essential mapping coordinates
+                    'reference_id': read_obj.reference_id,
+                    'reference_start': read_obj.reference_start,
+                    'reference_end': read_obj.reference_end,
+                    'next_reference_id': read_obj.next_reference_id,
+                    'next_reference_start': read_obj.next_reference_start,
+                    'template_length': read_obj.template_length,
+                    # Quality information
+                    'mapping_quality': read_obj.mapping_quality,
+                    'query_qualities': list(read_obj.query_qualities) if read_obj.query_qualities is not None else None,
+                    # All tags for complete reconstruction
+                    'tags': dict(read_obj.get_tags()) if hasattr(read_obj, 'get_tags') else {},
+                    # Reference name (if available)
+                    'reference_name': read_obj.reference_name if hasattr(read_obj, 'reference_name') else None,
+                    'next_reference_name': read_obj.next_reference_name if hasattr(read_obj, 'next_reference_name') else None,
                 })
+                
+                # Store mismatches for viewer (keeping existing functionality)
+                mismatches_list = get_mismatches_from_read(read_obj)
+                record_info['mismatches'] = mismatches_list
+                
             elif isinstance(read_obj, SeqIO.SeqRecord):
                  record_info.update({
-                     'name': read_obj.id, 'description': read_obj.description, 'is_reverse': False
+                     'name': read_obj.id,
+                     'description': read_obj.description,
+                     'is_reverse': False,
+                     'query_qualities': list(read_obj.letter_annotations.get("phred_quality", [])) if read_obj.letter_annotations.get("phred_quality") else None,
+                     'mismatches': []
                  })
             serializable_reads.append(record_info)
+            
         processed_data_output = {
-            'reads': serializable_reads, 'format': file_format_inferred,
-            'filename': selected_file, 'filters_applied': filters, 'error': None
+            'reads': serializable_reads,
+            'format': file_format_inferred,
+            'filename': selected_file,
+            'filters_applied': filters,
+            'file_header': file_header,  # Store header for export
+            'error': None
         }
 
         # --- 8. Calculate Alignment Stats ---
