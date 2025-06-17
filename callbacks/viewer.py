@@ -61,7 +61,7 @@ def load_and_filter_viewer_data(
         # For viewer filtering, 'exclude' on softclip_display_filter_option means 'exclude_all'
         initial_load_soft_clip_opt = 'exclude_regions' if softclip_display_filter_option == 'exclude_regions_length_effect_only' else 'show' # Or 'show' generally
         
-        raw_reads_data_tuples, file_format_inferred, _ = load_reads_from_file(
+        raw_reads_data_tuples, file_format_inferred, _, file_header = load_reads_from_file(
             file_data['content'],
             file_data['filename'],
             soft_clip_option=initial_load_soft_clip_opt # Viewer mainly cares about full seq for display
@@ -101,17 +101,28 @@ def load_and_filter_viewer_data(
         # --- 6. Serialize Reads for viewer-processed-data-store ---
         # The viewer needs more info than the main page plots for detailed rendering.
         serializable_viewer_reads = []
+        
+        # Store the header for potential export use (same as main page)
+        file_header = None
+        if file_format_inferred in ['bam', 'sam'] and final_reads_tuples:
+            first_read_obj = final_reads_tuples[0][4]
+            if isinstance(first_read_obj, pysam.AlignedSegment):
+                try:
+                    file_header = first_read_obj.header.to_dict() if hasattr(first_read_obj, 'header') else None
+                except:
+                    logger.warning("Could not extract header from read object in viewer")
+        
         for length, cg, nm_val, seq_str, read_obj, mapq_val in final_reads_tuples:
             record_info = {
-                'length': length, # This is the length calculated based on initial_load_soft_clip_opt
+                'length': length,
                 'cg': cg,
-                'nm': nm_val, # Potentially adjusted NM
-                'seq': seq_str, # Viewer NEEDS the sequence
+                'nm': nm_val,
+                'seq': seq_str,
                 'mapq': mapq_val,
             }
             if isinstance(read_obj, pysam.AlignedSegment):
-                # Store more details needed for rendering individual BAM/SAM reads
-                mismatches_list = get_mismatches_from_read(read_obj) # Get serializable mismatch list
+                # Store comprehensive mapping information (same as main page)
+                mismatches_list = get_mismatches_from_read(read_obj)
 
                 record_info.update({
                     'name': read_obj.query_name,
@@ -120,27 +131,37 @@ def load_and_filter_viewer_data(
                     'is_reverse': read_obj.is_reverse,
                     'cigarstring': read_obj.cigarstring,
                     'md_tag': read_obj.get_tag('MD') if read_obj.has_tag('MD') else None,
-                    'original_nm_tag': read_obj.get_tag('NM') if read_obj.has_tag('NM') else None, # Original NM
-                    'query_qualities': list(read_obj.query_qualities) if read_obj.query_qualities is not None else None, # Convert to list
-                    'mismatches': mismatches_list, # Store pre-calculated mismatches
-                    # You cannot store read_obj.get_aligned_pairs() output directly if it contains complex objects.
-                    # Instead, the highlighting function will need to work with the stored seq and mismatches.
+                    'original_nm_tag': read_obj.get_tag('NM') if read_obj.has_tag('NM') else None,
+                    'query_qualities': list(read_obj.query_qualities) if read_obj.query_qualities is not None else None,
+                    'mismatches': mismatches_list,
+                    # Additional mapping information for complete reconstruction
+                    'reference_id': read_obj.reference_id,
+                    'reference_start': read_obj.reference_start,
+                    'reference_end': read_obj.reference_end,
+                    'next_reference_id': read_obj.next_reference_id,
+                    'next_reference_start': read_obj.next_reference_start,
+                    'template_length': read_obj.template_length,
+                    'mapping_quality': read_obj.mapping_quality,
+                    'tags': dict(read_obj.get_tags()) if hasattr(read_obj, 'get_tags') else {},
+                    'reference_name': read_obj.reference_name if hasattr(read_obj, 'reference_name') else None,
+                    'next_reference_name': read_obj.next_reference_name if hasattr(read_obj, 'next_reference_name') else None,
                 })
             elif isinstance(read_obj, SeqIO.SeqRecord):
                  record_info.update({
                      'name': read_obj.id,
                      'description': read_obj.description,
-                     'is_reverse': False, # Default for FASTA/Q
+                     'is_reverse': False,
                      'query_qualities': list(read_obj.letter_annotations.get("phred_quality", [])) if read_obj.letter_annotations.get("phred_quality") else None,
-                     'mismatches': [] # No mismatches for FASTA/Q in this context
+                     'mismatches': []
                  })
             serializable_viewer_reads.append(record_info)
 
         return {
-            'reads': serializable_viewer_reads, # Store the list of DETAILED DICTIONARIES
+            'reads': serializable_viewer_reads,
             'format': file_format_inferred,
             'filename': selected_file,
-            'filters_applied': viewer_filters, # Store the viewer-specific filters
+            'filters_applied': viewer_filters,
+            'file_header': file_header,  # Store header for export
             'error': None
         }
 
