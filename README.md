@@ -77,7 +77,7 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
    cd GRAFT
    chmod 755 .
    chmod -R u+w .
-   python setup.py
+   python index.py
    ```
 
 Note: If you want to use the deprecated DUST masking module, execute setup.py in the DUST folder.
