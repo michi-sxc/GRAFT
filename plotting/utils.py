@@ -40,8 +40,20 @@ def create_light_theme_figure(fig_dark):
         font=dict(color='black'), 
     )
     # Update axes for light theme
-    fig_light.update_xaxes(gridcolor='lightgrey', linecolor='black', zerolinecolor='lightgrey', color='black', title_font_color='black', tickfont_color='black')
-    fig_light.update_yaxes(gridcolor='lightgrey', linecolor='black', zerolinecolor='lightgrey', color='black', title_font_color='black', tickfont_color='black')
+    fig_light.update_xaxes(
+        gridcolor='lightgrey', 
+        linecolor='black', 
+        zerolinecolor='lightgrey', 
+        title_font=dict(color='black'), 
+        tickfont=dict(color='black')
+    )
+    fig_light.update_yaxes(
+        gridcolor='lightgrey', 
+        linecolor='black', 
+        zerolinecolor='lightgrey', 
+        title_font=dict(color='black'), 
+        tickfont=dict(color='black')
+    )
 
     # Specific trace color adjustments 
     # Adjust according to layout specs
