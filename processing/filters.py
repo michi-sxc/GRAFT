@@ -3,7 +3,7 @@ import pysam
 from utils.helpers import reverse_complement
 from .stats import count_ct_changes, get_mismatches_from_read # Relative import
 import logging
-import dust_module # deprecated, but kept for compatibility
+#import dust_module # deprecated, but kept for compatibility
 from Bio.Seq import Seq
 
 logger = logging.getLogger(__name__)
@@ -25,16 +25,16 @@ def apply_filters_to_read(read_tuple, file_format, filters):
     apply_dust = filters.get('apply_dust', False) # Add DUST filter option
 
     # --- DUST Filter ---
-    if apply_dust and seq:
-        try:
-            # dust_mask returns the sequence or raises an error/returns specific value, but not in GitHub repo (deprecated)
-            masked_seq = dust_module.dust_mask(seq)
-            # Simple check: if the entire sequence is masked (all 'N'), filter it out
-            if set(masked_seq) == {'N'}:
-                return False
-        except Exception as e:
-             logger.warning(f"DUST module failed for read {getattr(read_obj, 'query_name', 'N/A')}: {e}")
-             # pass
+    # if apply_dust and seq:
+    #     try:
+    #         # dust_mask returns the sequence or raises an error/returns specific value, but not in GitHub repo (deprecated)
+    #         masked_seq = dust_module.dust_mask(seq)
+    #         # Simple check: if the entire sequence is masked (all 'N'), filter it out
+    #         if set(masked_seq) == {'N'}:
+    #             return False
+    #     except Exception as e:
+    #          logger.warning(f"DUST module failed for read {getattr(read_obj, 'query_name', 'N/A')}: {e}")
+    #          # pass
 
     # --- BAM/SAM Specific Filters ---
     if file_format in ['bam', 'sam']:
