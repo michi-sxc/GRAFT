@@ -24,18 +24,22 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
 * Python 3.12+
 * Core dependencies:
   ```
-  dash==2.17.1
-  dash-bootstrap-components==1.6.0
-  dash_dangerously_set_inner_html==0.0.2
-  dash-iconify==0.1.2
-  pysam==0.22.1
+  Bio==1.8.0
   biopython==1.81
-  numpy==1.26.4
+  dash==2.17.1
+  dash_bootstrap_components==1.6.0
+  dash_iconify==0.1.2
+  diskcache==5.6.3
+  dust_module==1.0
+  Flask==3.1.1
+  numpy==2.3.0
+  pandas==2.3.0
   plotly==5.22.0
-  pandas==2.2.1
-  celery==5.4.0
+  pysam==0.22.1
   PyYAML==6.0.2
-  ansi2html==1.9.2
+  PyYAML==6.0.2
+  scipy==1.15.3
+
   ```
 
 ## Installation
@@ -80,7 +84,7 @@ GRAFT is a Python-based toolkit for analyzing ancient DNA data through an intera
    python index.py
    ```
 
-Note: If you want to use the deprecated DUST masking module, execute setup.py in the DUST folder.
+Note: If you want to use the deprecated DUST masking module, remove the coments in /processing/filters.py and execute setup.py in the DUST folder.
 
 ### File Permissions Structure
 
