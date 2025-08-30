@@ -67,14 +67,12 @@ def create_read_length_histogram(processed_reads_data_list_of_dicts, selected_le
         title='Read Length Distribution and Average CG Content',
         xaxis_title='Read Length (bp)',
         yaxis=dict(
-            title='Read Count',
-            titlefont_color=colors['line'],
-            tickfont_color=colors['muted']
+            title=dict(text='Read Count', font=dict(color=colors['line'])),
+            tickfont=dict(color=colors['muted'])
         ),
         yaxis2=dict(
-            title='Average CG Content',
-            titlefont_color=colors['highlight'],
-            tickfont_color=colors['muted'],
+            title=dict(text='Average CG Content', font=dict(color=colors['highlight'])),
+            tickfont=dict(color=colors['muted']),
             overlaying='y',
             side='right',
             range=[0, 1],
